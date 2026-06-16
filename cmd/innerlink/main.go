@@ -120,7 +120,7 @@ func run() error {
 			switch ev.Type {
 			case discovery.PeerAdded:
 				log.Printf("[PEER ] joined   peer=%s at %s", peerHex(ev.PeerID), ev.Peer.Addr)
-				go dialAndHandshake(ctx, id, ev.Peer, channels)
+				go dialAndHandshake(ctx, id, tr, ev.Peer, channels)
 			case discovery.PeerRemoved:
 				log.Printf("[PEER ] left     peer=%s", peerHex(ev.PeerID))
 			}
@@ -204,7 +204,7 @@ func (r *channelRegistry) closeAll() {
 // check is done here rather than at the call site so that races
 // between two simultaneous dialAndHandshake goroutines for the
 // same peer also collapse to a single connection.
-func dialAndHandshake(ctx context.Context, id *identity.Identity, p *discovery.Peer, reg *channelRegistry) {
+func dialAndHandshake(ctx context.Context, id *identity.Identity, tr *transport.Transport, p *discovery.Peer, reg *channelRegistry) {
 	if p.Addr == nil {
 		return
 	}
@@ -219,7 +219,12 @@ func dialAndHandshake(ctx context.Context, id *identity.Identity, p *discovery.P
 	tcpAddr := fmt.Sprintf("%s:%d", p.Addr.IP.String(), transport.DefaultPort)
 	dctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	conn, err := reg_transportDial(dctx, tcpAddr)
+	// Use Transport.Dial, NOT transport.DialStandalone. The
+	// former registers the Conn in the transport's registry, so
+	// the heartbeat loop sends keepalives to it. DialStandalone
+	// would skip registration and the conn would die from
+	// read-deadline timeout after 60s of idle.
+	conn, err := tr.Dial(dctx, tcpAddr)
 	if err != nil {
 		log.Printf("[ERROR] dial %s: %v", tcpAddr, err)
 		return
@@ -381,14 +386,6 @@ func pingPeer(reg *channelRegistry, peerHex string) {
 	}
 	_ = ch.SendPing(context.Background())
 	log.Printf("[MSG  ] out >%s> ping", peerHex)
-}
-
-// reg_transportDial is a tiny indirection so tests can swap it
-// out. In the production build it uses transport.DialStandalone,
-// which doesn't require a Transport to be set up first (useful
-// for the CLI's "dial a peer I just discovered" hot path).
-var reg_transportDial = func(ctx context.Context, addr string) (*transport.Conn, error) {
-	return transport.DialStandalone(ctx, addr)
 }
 
 // peerHex returns a 32-char lowercase hex of a PeerID. If the
