@@ -287,3 +287,27 @@ func PeerIDFromPublicKey(pub []byte) ([]byte, error) {
 	copy(out, sum[:PeerIDSize])
 	return out, nil
 }
+
+// PrivateKeyFromAny unwraps the private key from an Identity
+// without exposing the concrete gmsm type to callers outside this
+// package. The only function in the public API that does this is
+// internal/handshake (which needs the raw key for SM2 ECDH); we
+// keep the type assertion in one place so other consumers can't.
+//
+// Returns an error if d isn't a *Identity (i.e. isn't one of ours).
+func PrivateKeyFromAny(d interface{}) (*sm2.PrivateKey, error) {
+	switch v := d.(type) {
+	case *Identity:
+		if v == nil || v.priv == nil {
+			return nil, errors.New("identity: nil identity")
+		}
+		return v.priv, nil
+	case *sm2.PrivateKey:
+		if v == nil {
+			return nil, errors.New("identity: nil private key")
+		}
+		return v, nil
+	default:
+		return nil, fmt.Errorf("identity: not an innerlink *Identity: %T", d)
+	}
+}

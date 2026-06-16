@@ -103,6 +103,18 @@ type Conn struct {
 // RemoteAddr returns the peer's network address.
 func (c *Conn) RemoteAddr() net.Addr { return c.remote }
 
+// NewConnForTest wraps a raw net.Conn as a *Conn. This is intended
+// for use in other packages' tests (e.g. internal/handshake) that
+// need to construct a Conn without going through Transport.Listen
+// + Accept. NOT part of the public API.
+func NewConnForTest(tcp net.Conn) *Conn {
+	return &Conn{
+		tcp:    tcp,
+		remote: tcp.RemoteAddr(),
+		closed: make(chan struct{}),
+	}
+}
+
 // Close shuts down the connection. Safe to call multiple times;
 // subsequent calls return ErrClosed.
 func (c *Conn) Close() error {

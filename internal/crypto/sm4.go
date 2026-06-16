@@ -251,3 +251,11 @@ func NewNonce(n int) ([]byte, error) {
 	}
 	return b, nil
 }
+
+// NewNonceFill fills the given buffer with random bytes from
+// crypto/rand. It mirrors io.ReadFull's (n, err) return shape
+// and is what higher layers (handshake, discovery) use to fill
+// caller-allocated buffers.
+func NewNonceFill(b []byte) (int, error) {
+	return io.ReadFull(rand.Reader, b)
+}
