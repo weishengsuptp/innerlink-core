@@ -99,7 +99,7 @@ func TestRecv(t *testing.T) {
 		raw.Write(want)
 	}()
 
-	frame, err := c.Recv()
+	frame, err := c.Recv(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +145,7 @@ func TestRecvRejectsOversizedFrame(t *testing.T) {
 	binary.BigEndian.PutUint32(hdr[:], MaxFrameSize+1)
 	raw.Write(hdr[:])
 
-	_, err := c.Recv()
+	_, err := c.Recv(context.Background())
 	if !errors.Is(err, ErrFrameTooLarge) {
 		t.Errorf("expected ErrFrameTooLarge, got %v", err)
 	}
@@ -172,7 +172,7 @@ func TestSendAfterCloseReturnsErrClosed(t *testing.T) {
 func TestRecvAfterCloseReturnsErrClosed(t *testing.T) {
 	c, _ := newTestConn(t)
 	c.Close()
-	_, err := c.Recv()
+	_, err := c.Recv(context.Background())
 	if !errors.Is(err, ErrClosed) {
 		t.Errorf("Recv after Close: got %v, want ErrClosed", err)
 	}
@@ -253,7 +253,7 @@ func TestTransportListenAndAccept(t *testing.T) {
 		if err := c.Send([]byte("ping")); err != nil {
 			t.Fatal(err)
 		}
-		frame, err := inbound.Recv()
+		frame, err := inbound.Recv(context.Background())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -326,7 +326,7 @@ func TestHeartbeatSendsEmptyFrames(t *testing.T) {
 		for inbound := range tr.Inbounds() {
 			// Read 0-byte frames forever until conn closes.
 			for {
-				if _, err := inbound.Recv(); err != nil {
+				if _, err := inbound.Recv(context.Background()); err != nil {
 					inbound.Close()
 					break
 				}

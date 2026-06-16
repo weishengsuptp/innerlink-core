@@ -34,6 +34,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	ic "github.com/weishengsuptp/innerlink-core/internal/crypto"
@@ -113,6 +114,13 @@ type Channel struct {
 	conn       *transport.Conn
 	session    *handshake.Session
 	remotePeer []byte // 16 bytes, copy of session.RemotePeerID
+
+	// recvMu serializes Channel.Recv because the underlying
+	// transport.Conn is single-reader. Multiple goroutines on
+	// the same Channel may still call Send concurrently (writes
+	// are serialized inside transport.Conn.writeMu), but only
+	// one goroutine at a time may call Recv.
+	recvMu sync.Mutex
 }
 
 // NewChannel wraps a transport.Conn that has just completed the
@@ -224,11 +232,23 @@ func (c *Channel) send(ctx context.Context, env Envelope) error {
 
 // Recv blocks until one frame arrives, decrypts it, and returns
 // the inner Envelope. Honors ctx for cancellation.
+//
+// Multiple goroutines may safely call Recv on the same Channel
+// — they will be serialized internally. (The underlying
+// transport.Conn is single-reader; the Channel manages a
+// recvMu to enforce this.)
 func (c *Channel) Recv(ctx context.Context) (Envelope, error) {
 	if err := ctx.Err(); err != nil {
 		return Envelope{}, err
 	}
-	fr, err := c.conn.Recv()
+	c.recvMu.Lock()
+	defer c.recvMu.Unlock()
+	// Re-check ctx after acquiring the lock — a cancellation
+	// may have happened while we were queued.
+	if err := ctx.Err(); err != nil {
+		return Envelope{}, err
+	}
+	fr, err := c.conn.Recv(ctx)
 	if err != nil {
 		return Envelope{}, fmt.Errorf("protocol: recv frame: %w", err)
 	}

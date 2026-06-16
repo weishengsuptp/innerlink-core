@@ -37,6 +37,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"sync"
 	"time"
@@ -161,7 +162,7 @@ func (c *Conn) Send(body []byte) error {
 }
 
 // Recv reads one frame from the peer. Blocks until a complete
-// frame arrives or the connection closes.
+// frame arrives, the connection closes, or ctx fires.
 //
 // If the incoming frame is a heartbeat (single 0x00 byte body),
 // Recv transparently reads the next frame. Callers don't need to
@@ -169,20 +170,38 @@ func (c *Conn) Send(body []byte) error {
 // at this layer.
 //
 // Concurrency: NOT safe. Only one goroutine per Conn may call Recv.
-func (c *Conn) Recv() (Frame, error) {
+func (c *Conn) Recv(ctx context.Context) (Frame, error) {
 	for {
-		fr, err := c.recvOnce()
+		select {
+		case <-c.closed:
+			return Frame{}, ErrClosed
+		case <-ctx.Done():
+			return Frame{}, ctx.Err()
+		default:
+		}
+		fr, err := c.recvOnce(ctx)
 		if err != nil {
 			return Frame{}, err
 		}
 		if isHeartbeat(fr) {
 			continue
 		}
+		if debugFrameTrace {
+			log.Printf("[transport-trace] non-heartbeat frame body_len=%d remote=%s", len(fr.Body), c.remote)
+		}
 		return fr, nil
 	}
 }
 
-func (c *Conn) recvOnce() (Frame, error) {
+// SetDebugFrameTrace enables per-frame logging on Conn.Recv.
+// Off by default; set to true via SetDebugFrameTrace when
+// debugging a non-heartbeat frame reaching the protocol layer.
+var debugFrameTrace = false
+
+// SetDebugFrameTrace turns on/off transport.Recv frame tracing.
+func SetDebugFrameTrace(on bool) { debugFrameTrace = on }
+
+func (c *Conn) recvOnce(ctx context.Context) (Frame, error) {
 	select {
 	case <-c.closed:
 		return Frame{}, ErrClosed
@@ -190,7 +209,7 @@ func (c *Conn) recvOnce() (Frame, error) {
 	}
 
 	var hdr [HeaderSize]byte
-	if err := readFull(c.tcp, hdr[:], c.readDeadline()); err != nil {
+	if err := readFullCtx(c.tcp, hdr[:], c.readDeadline(), ctx); err != nil {
 		c.Close()
 		return Frame{}, err
 	}
@@ -201,7 +220,7 @@ func (c *Conn) recvOnce() (Frame, error) {
 	}
 	body := make([]byte, n)
 	if n > 0 {
-		if err := readFull(c.tcp, body, c.readDeadline()); err != nil {
+		if err := readFullCtx(c.tcp, body, c.readDeadline(), ctx); err != nil {
 			c.Close()
 			return Frame{}, err
 		}
@@ -243,6 +262,36 @@ func readFull(r io.Reader, buf []byte, deadline time.Time) error {
 	}
 	_, err := io.ReadFull(r, buf)
 	return err
+}
+
+// readFullCtx is readFull with a context cancellation path.
+// On cancel, SetReadDeadline is set to a past time so the
+// in-flight Read returns immediately with a timeout error,
+// which we then translate to ctx.Err().
+//
+// Why: io.ReadFull does not take a ctx. The standard way to
+// cancel a Read is to push the deadline into the past.
+func readFullCtx(r io.Reader, buf []byte, deadline time.Time, ctx context.Context) error {
+	if d, ok := r.(interface{ SetReadDeadline(time.Time) error }); ok {
+		_ = d.SetReadDeadline(deadline)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := io.ReadFull(r, buf)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		if d, ok := r.(interface{ SetReadDeadline(time.Time) error }); ok {
+			_ = d.SetReadDeadline(time.Now())
+		}
+		// Drain the goroutine. It will return with a timeout
+		// error; we don't care about the result.
+		<-done
+		return ctx.Err()
+	}
 }
 
 // Transport is the multi-peer TCP manager. One Transport per

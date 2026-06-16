@@ -419,7 +419,7 @@ func readFrame(ctx context.Context, conn *transport.Conn) (*frame, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	fr, err := conn.Recv()
+	fr, err := conn.Recv(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("handshake: recv frame: %w", err)
 	}

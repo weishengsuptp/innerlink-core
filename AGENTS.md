@@ -115,3 +115,26 @@ If you add a new message type to the protocol layer, prefer
 adding it via the public `Send` rather than calling `send`
 directly — otherwise From/TS/MsgID/Version get skipped and
 the receiver drops the envelope as malformed.
+
+## Channel.Recv is NOT safe for concurrent callers (踩过的坑)
+
+A `protocol.Channel` wraps a single underlying `transport.Conn`,
+and `Channel.Recv` reads one frame at a time. The underlying
+`Conn.Recv` is documented as single-reader; calling it from
+two goroutines on the same Channel causes frames to be split
+between the callers, which surfaces as random "protocol: frame
+too short" / "frame too large" errors — even when neither
+goroutine is sending anything weird.
+
+**Rule:** exactly ONE goroutine per Channel may call
+`Channel.Recv`. If multiple subsystems (chat pump, file
+receiver, custom protocol, …) need to read from the same
+Channel, write a single dispatcher that calls Recv once and
+routes by `env.Type`.
+
+`filetransfer.Receiver` ships two APIs:
+  - `Receiver.Loop(ctx)` — its own pump; use when file
+    traffic is the only thing on the channel.
+  - `Receiver.Handle(ctx, env)` — receive-one-envelope;
+    use from a shared dispatcher (the cmd/innerlink CLI
+    pattern).
