@@ -45,10 +45,17 @@ import (
 // Bumped if the wire format changes incompatibly.
 const ProtocolVersion = 1
 
-// MaxEnvelopeSize caps the post-decryption envelope size. Generous
-// because chat messages are small; if a peer sends a 1 MB envelope
-// it's almost certainly broken (or malicious).
-const MaxEnvelopeSize = 1 << 20 // 1 MiB
+// MaxEnvelopeSize caps the post-decryption envelope size.
+//
+// 4 MiB fits one full filetransfer chunk (1 MiB raw bytes
+// base64-encoded to ~1.4 MiB, plus JSON/Envelope overhead) with
+// ~2.6 MiB of headroom. A peer sending 4 MiB of envelope is
+// almost certainly broken (or malicious), but a single
+// legitimate file chunk must fit.
+//
+// See internal/filetransfer.ChunkSize for the matching chunk
+// size on the wire.
+const MaxEnvelopeSize = 4 << 20 // 4 MiB
 
 // MsgType enumerates the message kinds we know about today.
 type MsgType string
@@ -64,6 +71,27 @@ const (
 	// for at-least-once delivery semantics in v0.2; v0.1 sends it
 	// but doesn't yet use it for anything.
 	TypeAck MsgType = "ack"
+
+	// -- File transfer (v0.2) --
+
+	// TypeFileOffer is sent by the file sender to advertise a new
+	// transfer. Payload is JSON-encoded FileOffer:
+	//   {fileID, name, size, sha256, totalChunks, chunkSize}
+	TypeFileOffer MsgType = "file-offer"
+	// TypeFileAccept is the receiver's response. Payload is JSON:
+	//   {fileID, acceptedChunks:[uint32...]}   // indexes already
+	//   on disk, sender skips them (resume support).
+	TypeFileAccept MsgType = "file-accept"
+	// TypeFileChunk is one slice of the file. Payload is JSON:
+	//   {fileID, index, sha256, data(base64-of-1MiB)}
+	TypeFileChunk MsgType = "file-chunk"
+	// TypeFileDone is the receiver's final ack: all chunks
+	// received, full-file SHA-256 verified.
+	//   {fileID, ok, err?}
+	TypeFileDone MsgType = "file-done"
+	// TypeFileAbort is sent by either side to cancel the transfer.
+	//   {fileID, reason}
+	TypeFileAbort MsgType = "file-abort"
 )
 
 // Envelope is the application-level message structure that gets
@@ -134,6 +162,16 @@ func (c *Channel) SendText(ctx context.Context, text string) error {
 // SendPing sends a liveness probe.
 func (c *Channel) SendPing(ctx context.Context) error {
 	return c.send(ctx, Envelope{Type: TypePing})
+}
+
+// Send transmits a fully-formed Envelope. The Channel fills in
+// Version, From, TS, and MsgID if the caller leaves them zero.
+// Type and Payload must be set.
+//
+// Use this for non-chat message types (file transfer, custom
+// application protocols). For chat, prefer SendText.
+func (c *Channel) Send(ctx context.Context, env Envelope) error {
+	return c.send(ctx, env)
 }
 
 // send is the internal workhorse. Builds an Envelope (filling in

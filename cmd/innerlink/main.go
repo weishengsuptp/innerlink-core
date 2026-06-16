@@ -42,6 +42,7 @@ import (
 	"time"
 
 	"github.com/weishengsuptp/innerlink-core/internal/discovery"
+	"github.com/weishengsuptp/innerlink-core/internal/filetransfer"
 	"github.com/weishengsuptp/innerlink-core/internal/handshake"
 	"github.com/weishengsuptp/innerlink-core/internal/identity"
 	"github.com/weishengsuptp/innerlink-core/internal/protocol"
@@ -95,6 +96,14 @@ func run() error {
 		}
 	}()
 
+	// Default save dir for incoming files. Created on first
+	// use by the Receiver.
+	saveDir, err := defaultSaveDir()
+	if err != nil {
+		return fmt.Errorf("resolve save dir: %w", err)
+	}
+	log.Printf("[INFO ] incoming files save dir: %s", saveDir)
+
 	// 4) + 5) Glue: discovery → dial → handshake → channel.
 	channels := newChannelRegistry()
 	defer channels.closeAll()
@@ -109,7 +118,7 @@ func run() error {
 				if !ok {
 					return
 				}
-				go handleInbound(ctx, id, inbound, channels)
+				go handleInbound(ctx, id, inbound, channels, saveDir)
 			}
 		}
 	}()
@@ -120,7 +129,7 @@ func run() error {
 			switch ev.Type {
 			case discovery.PeerAdded:
 				log.Printf("[PEER ] joined   peer=%s at %s", peerHex(ev.PeerID), ev.Peer.Addr)
-				go dialAndHandshake(ctx, id, tr, ev.Peer, channels)
+				go dialAndHandshake(ctx, id, tr, ev.Peer, channels, saveDir)
 			case discovery.PeerRemoved:
 				log.Printf("[PEER ] left     peer=%s", peerHex(ev.PeerID))
 			}
@@ -204,7 +213,7 @@ func (r *channelRegistry) closeAll() {
 // check is done here rather than at the call site so that races
 // between two simultaneous dialAndHandshake goroutines for the
 // same peer also collapse to a single connection.
-func dialAndHandshake(ctx context.Context, id *identity.Identity, tr *transport.Transport, p *discovery.Peer, reg *channelRegistry) {
+func dialAndHandshake(ctx context.Context, id *identity.Identity, tr *transport.Transport, p *discovery.Peer, reg *channelRegistry, saveDir string) {
 	if p.Addr == nil {
 		return
 	}
@@ -235,12 +244,12 @@ func dialAndHandshake(ctx context.Context, id *identity.Identity, tr *transport.
 		return
 	}
 	log.Printf("[HANDS] ok       peer=%s (initiator)", peerHex(p.PeerID))
-	wrapChannel(ctx, conn, sess, reg)
+	wrapChannel(ctx, conn, sess, reg, saveDir)
 }
 
 // handleInbound is the responder counterpart: another peer
 // dialed us, ran the handshake; we accept and wrap.
-func handleInbound(ctx context.Context, id *identity.Identity, conn *transport.Conn, reg *channelRegistry) {
+func handleInbound(ctx context.Context, id *identity.Identity, conn *transport.Conn, reg *channelRegistry, saveDir string) {
 	hctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	sess, err := handshake.RunAsResponder(hctx, id, conn)
@@ -249,13 +258,18 @@ func handleInbound(ctx context.Context, id *identity.Identity, conn *transport.C
 		return
 	}
 	log.Printf("[HANDS] ok       peer=%s (responder)", peerHex(sess.RemotePeerID))
-	wrapChannel(ctx, conn, sess, reg)
+	wrapChannel(ctx, conn, sess, reg, saveDir)
 }
 
 // wrapChannel takes a freshly-handed-shaked Conn+Session and
-// constructs a Channel. Starts a goroutine that pumps inbound
-// Envelopes to stdout and registers the channel in the registry.
-func wrapChannel(ctx context.Context, conn *transport.Conn, sess *handshake.Session, reg *channelRegistry) {
+// constructs a Channel. Starts:
+//   - a Recv pump for chat traffic (text/ping/pong),
+//   - a filetransfer.Receiver in the background to accept
+//     incoming file offers.
+//
+// saveDir is where completed incoming files land. If empty,
+// defaults to <home>/Downloads/innerlink.
+func wrapChannel(ctx context.Context, conn *transport.Conn, sess *handshake.Session, reg *channelRegistry, saveDir string) {
 	ch, err := protocol.NewChannel(conn, sess)
 	if err != nil {
 		log.Printf("[ERROR] new channel: %v", err)
@@ -273,6 +287,8 @@ func wrapChannel(ctx context.Context, conn *transport.Conn, sess *handshake.Sess
 	}
 	log.Printf("[INFO ] channel ready peer=%s", peerHex(sess.RemotePeerID))
 
+	// Chat pump. Drops non-chat envelopes — file traffic is
+	// owned by the Receiver below.
 	go func() {
 		defer reg.delete(sess.RemotePeerID)
 		for {
@@ -293,6 +309,29 @@ func wrapChannel(ctx context.Context, conn *transport.Conn, sess *handshake.Sess
 			case protocol.TypePong:
 				// ignore for v0.1
 			}
+		}
+	}()
+
+	// File receiver. Each Channel gets its own Receiver; they
+	// read from the same ch.Recv in a separate goroutine, so
+	// chat + file coexist on the same Channel.
+	peerHexStr := peerHex(sess.RemotePeerID)
+	go func() {
+		rcv, err := filetransfer.NewReceiver(ch, saveDir, func(o filetransfer.FileOffer, _ string) error {
+			log.Printf("[FILE] incoming peer=%s name=%q size=%d from=%s",
+				peerHexStr, o.Name, o.Size, peerHexStr)
+			return nil // accept everything by default
+		}, peerHexStr)
+		if err != nil {
+			log.Printf("[ERROR] filetransfer receiver for %s: %v", peerHexStr, err)
+			return
+		}
+		// Receiver.Loop reads non-stop; chat pump owns the
+		// other half. When the chat pump's Recv returns an
+		// error, this one will too because they share the
+		// underlying conn.
+		if err := rcv.Loop(ctx); err != nil && ctx.Err() == nil {
+			log.Printf("[FILE] receiver closed peer=%s (%v)", peerHexStr, err)
 		}
 	}()
 }
@@ -323,6 +362,12 @@ func runStdinLoop(ctx context.Context, cancel context.CancelFunc, reg *channelRe
 			} else {
 				sendTo(reg, parts[1], parts[2])
 			}
+		case "sendfile":
+			if len(parts) < 3 {
+				log.Println("[USAGE] sendfile <peer-id-hex> <local-path>")
+			} else {
+				sendFile(reg, parts[1], parts[2])
+			}
 		case "ping":
 			if len(parts) < 2 {
 				log.Println("[USAGE] ping <peer-id-hex>")
@@ -332,11 +377,12 @@ func runStdinLoop(ctx context.Context, cancel context.CancelFunc, reg *channelRe
 		case "peers":
 			log.Printf("[INFO ] no peer listing in v0.1; check the [PEER] log lines above")
 		case "help":
-			log.Println("[HELP ] send <peer-id-hex> <text>  -- send a chat message")
-			log.Println("[HELP ] ping <peer-id-hex>         -- send a liveness probe")
-			log.Println("[HELP ] peers                       -- (see [PEER] log lines)")
-			log.Println("[HELP ] help                        -- this list")
-			log.Println("[HELP ] quit                        -- exit")
+			log.Println("[HELP ] send <peer-id-hex> <text>   -- send a chat message")
+			log.Println("[HELP ] sendfile <peer-id-hex> <path> -- send a file")
+			log.Println("[HELP ] ping <peer-id-hex>           -- send a liveness probe")
+			log.Println("[HELP ] peers                         -- (see [PEER] log lines)")
+			log.Println("[HELP ] help                          -- this list")
+			log.Println("[HELP ] quit                          -- exit")
 		case "quit", "exit":
 			log.Println("[INFO ] bye")
 			cancel()
@@ -371,6 +417,36 @@ func sendTo(reg *channelRegistry, peerHex, text string) {
 		return
 	}
 	log.Printf("[MSG  ] out >%s> %s", peerHex, text)
+}
+
+// sendFile streams a local file to the named peer. Blocking;
+// the REPL doesn't accept new stdin until the transfer
+// completes (or fails). Progress is logged every ~100ms.
+func sendFile(reg *channelRegistry, peerHex, path string) {
+	pid, err := hexToBytes(peerHex)
+	if err != nil {
+		log.Printf("[ERROR] bad peer id hex: %v", err)
+		return
+	}
+	ch := reg.get(pid)
+	if ch == nil {
+		log.Printf("[ERROR] no active channel for peer %s", peerHex)
+		return
+	}
+	progress := func(sent, total int64) {
+		pct := int64(0)
+		if total > 0 {
+			pct = sent * 100 / total
+		}
+		log.Printf("[FILE] sending %s to %s  %d/%d bytes (%d%%)",
+			path, peerHex, sent, total, pct)
+	}
+	log.Printf("[FILE] start send peer=%s path=%s", peerHex, path)
+	if err := filetransfer.Send(context.Background(), ch, path, progress); err != nil {
+		log.Printf("[ERROR] sendfile: %v", err)
+		return
+	}
+	log.Printf("[FILE] done peer=%s path=%s", peerHex, path)
 }
 
 func pingPeer(reg *channelRegistry, peerHex string) {

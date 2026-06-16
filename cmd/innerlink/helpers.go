@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"os"
+	"path/filepath"
 
 	"github.com/weishengsuptp/innerlink-core/internal/identity"
 )
@@ -42,4 +43,19 @@ func hostname() string {
 		return h
 	}
 	return "innerlink-node"
+}
+
+// defaultSaveDir returns the directory where incoming files
+// are written. We prefer ~/Downloads/innerlink; if HOME is
+// not set, we fall back to the current working directory.
+func defaultSaveDir() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		cwd, cerr := os.Getwd()
+		if cerr != nil {
+			return "", cerr
+		}
+		return filepath.Join(cwd, "downloads"), nil
+	}
+	return filepath.Join(home, "Downloads", "innerlink"), nil
 }
