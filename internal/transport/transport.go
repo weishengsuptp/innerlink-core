@@ -291,6 +291,26 @@ func (t *Transport) Dial(ctx context.Context, addr string) (*Conn, error) {
 	return c, nil
 }
 
+// DialStandalone dials a remote peer without requiring Listen() to
+// have been called first. It creates the bare minimum needed to
+// wrap a raw TCP connection in a Conn — useful for one-shot dial
+// from a CLI that hasn't set up a listener.
+//
+// The returned Conn is NOT registered in any global registry; the
+// caller owns its lifecycle.
+func DialStandalone(ctx context.Context, addr string) (*Conn, error) {
+	d := net.Dialer{Timeout: 10 * time.Second}
+	tcpConn, err := d.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("transport: dial %s: %w", addr, err)
+	}
+	return &Conn{
+		tcp:    tcpConn,
+		remote: tcpConn.RemoteAddr(),
+		closed: make(chan struct{}),
+	}, nil
+}
+
 // register wraps a raw TCP conn in our Conn type and stores it in
 // the registry. Idempotent on the same remote address: re-registering
 // returns the existing Conn (so two concurrent Dials to the same
