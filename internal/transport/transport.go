@@ -163,8 +163,26 @@ func (c *Conn) Send(body []byte) error {
 // Recv reads one frame from the peer. Blocks until a complete
 // frame arrives or the connection closes.
 //
+// If the incoming frame is a heartbeat (single 0x00 byte body),
+// Recv transparently reads the next frame. Callers don't need to
+// worry about heartbeats — the wire-level keepalive is invisible
+// at this layer.
+//
 // Concurrency: NOT safe. Only one goroutine per Conn may call Recv.
 func (c *Conn) Recv() (Frame, error) {
+	for {
+		fr, err := c.recvOnce()
+		if err != nil {
+			return Frame{}, err
+		}
+		if isHeartbeat(fr) {
+			continue
+		}
+		return fr, nil
+	}
+}
+
+func (c *Conn) recvOnce() (Frame, error) {
 	select {
 	case <-c.closed:
 		return Frame{}, ErrClosed
@@ -189,6 +207,13 @@ func (c *Conn) Recv() (Frame, error) {
 		}
 	}
 	return Frame{Body: body}, nil
+}
+
+// isHeartbeat identifies the 1-byte keepalive frame written by
+// Transport.heartbeatOnce. Anything else — including 0-byte
+// frames, which are reserved — is a real payload.
+func isHeartbeat(fr Frame) bool {
+	return len(fr.Body) == 1 && fr.Body[0] == 0x00
 }
 
 // readDeadline returns the time used as a per-frame read deadline.
@@ -424,9 +449,9 @@ func (t *Transport) Run(ctx context.Context) error {
 	return ctx.Err()
 }
 
-// heartbeatOnce sends a ping (0-byte body) to every active Conn.
-// The peer's Recv will see an empty Frame, which it can use as a
-// keepalive signal (or simply ignore).
+// heartbeatOnce sends a ping (1-byte 0x00 body) to every active
+// Conn. The peer's Recv will see a 1-byte Frame which the
+// protocol layer recognizes as a keepalive and discards.
 func (t *Transport) heartbeatOnce() {
 	t.mu.Lock()
 	conns := make([]*Conn, 0, len(t.conns))
@@ -435,10 +460,10 @@ func (t *Transport) heartbeatOnce() {
 	}
 	t.mu.Unlock()
 	for _, c := range conns {
-		// 0-byte body is a "ping" — it costs 4 bytes on the wire
-		// (just the length header) and exercises the write path
-		// end-to-end.
-		if err := c.Send(nil); err != nil {
+		// 1-byte body == 0x00 is the heartbeat marker. The
+		// protocol layer discards it on receive so it doesn't
+		// get mistaken for an Envelope.
+		if err := c.Send([]byte{0x00}); err != nil {
 			c.Close()
 			t.unregister(c)
 		}

@@ -150,14 +150,24 @@ func newChannelRegistry() *channelRegistry {
 	return &channelRegistry{m: make(map[string]*protocol.Channel)}
 }
 
-func (r *channelRegistry) set(peerID []byte, ch *protocol.Channel) {
+// set installs ch for peerID. If a Channel already exists for
+// this peer, set() closes the new one and returns the existing
+// one — the assumption is that the existing Channel was set up
+// first and is in active use, and a concurrent re-handshake
+// (caused by the announcer's periodic PeerAdded emissions) is
+// the redundant one we want to drop.
+//
+// Returns true if ch was installed, false if the existing one
+// was kept.
+func (r *channelRegistry) set(peerID []byte, ch *protocol.Channel) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	key := string(peerID)
-	if old, ok := r.m[key]; ok {
-		_ = old.Close()
+	if _, ok := r.m[key]; ok {
+		return false
 	}
 	r.m[key] = ch
+	return true
 }
 
 func (r *channelRegistry) get(peerID []byte) *protocol.Channel {
@@ -187,8 +197,23 @@ func (r *channelRegistry) closeAll() {
 // dialAndHandshake dials the peer's TCP endpoint (their transport
 // port — same as ours, since both run the same code), runs the
 // handshake, and registers the resulting Channel.
+//
+// If we already have a live Channel to this peer, this is a no-op
+// (announcer fires every announce interval, so the same peer
+// re-triggers PeerAdded on every cycle). The "have channel?"
+// check is done here rather than at the call site so that races
+// between two simultaneous dialAndHandshake goroutines for the
+// same peer also collapse to a single connection.
 func dialAndHandshake(ctx context.Context, id *identity.Identity, p *discovery.Peer, reg *channelRegistry) {
 	if p.Addr == nil {
+		return
+	}
+	// Skip if we already have a live channel to this peer. The
+	// announcer fires every announce interval, so the same peer
+	// re-triggers PeerAdded on every cycle; without this guard
+	// we'd dial again, double-handshake, and the second
+	// handshake would tear down the first channel.
+	if reg.get(p.PeerID) != nil {
 		return
 	}
 	tcpAddr := fmt.Sprintf("%s:%d", p.Addr.IP.String(), transport.DefaultPort)
@@ -232,7 +257,15 @@ func wrapChannel(ctx context.Context, conn *transport.Conn, sess *handshake.Sess
 		_ = conn.Close()
 		return
 	}
-	reg.set(sess.RemotePeerID, ch)
+	if !reg.set(sess.RemotePeerID, ch) {
+		// Race lost: another Channel for this peer was installed
+		// first. Close this one and bail without starting the
+		// Recv goroutine — the winner's goroutine already owns
+		// receive for this peer.
+		log.Printf("[INFO ] channel superseded peer=%s (keeping existing)", peerHex(sess.RemotePeerID))
+		_ = ch.Close()
+		return
+	}
 	log.Printf("[INFO ] channel ready peer=%s", peerHex(sess.RemotePeerID))
 
 	go func() {
