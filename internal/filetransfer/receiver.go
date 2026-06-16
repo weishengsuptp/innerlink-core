@@ -8,8 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/weishengsuptp/innerlink-core/internal/protocol"
 )
@@ -198,15 +200,19 @@ func (r *Receiver) handleChunk(ctx context.Context, env protocol.Envelope) {
 		return
 	}
 	offset := int64(fc.Index) * int64(ChunkSize)
+	writeStart := time.Now()
 	if _, err := f.WriteAt(fc.Data, offset); err != nil {
 		_ = f.Close()
 		_ = r.sendDone(ctx, pf, false, err.Error())
 		return
 	}
+	writeDur := time.Since(writeStart)
 	_ = f.Close()
 	pf.have[fc.Index] = true
 	pf.hashWhole.Write(fc.Data)
 	pf.bytesOnDisk += int64(len(fc.Data))
+	log.Printf("[FILE] recv chunk idx=%d/%d size=%d writeAt=%s peer=%s",
+		fc.Index, pf.offer.TotalChunks, len(fc.Data), writeDur, r.fromPeer)
 
 	// Last chunk?
 	if uint32(fc.Index) == pf.offer.TotalChunks-1 {
