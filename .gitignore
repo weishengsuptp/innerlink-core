@@ -1,0 +1,42 @@
+# Build outputs
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+build/bin/
+dist/
+
+# Test outputs
+*.test
+*.out
+coverage.out
+coverage.html
+
+# Frontend (Wails future)
+cmd/innerlink-desktop/frontend/node_modules/
+cmd/innerlink-desktop/frontend/dist/
+cmd/innerlink-desktop/frontend/wailsjs/
+
+# Local config & runtime
+*.log
+*.tmp
+.env
+.env.local
+innerlink.db
+*.db
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Go workspace
+go.work
+go.work.sum
+
+# HANDOFF 是公司 agent 的旧交接文档，跟新仓 innerlink-core 路径不匹配
+# 不入库。新仓重新写 docs/PRD.md / docs/ARCHITECTURE.md
+HANDOFF/

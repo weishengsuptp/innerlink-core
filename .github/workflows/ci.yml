@@ -1,0 +1,141 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - '**'
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # -------------------------------------------------------------------------
+  # 测试：3 平台并行
+  # -------------------------------------------------------------------------
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      - name: Download modules
+        shell: bash   # ⚠️ Windows runner 默认 PowerShell，加这个 ./... 才不会被拆坏
+        run: go mod download
+
+      - name: Verify modules
+        shell: bash
+        run: go mod verify
+
+      - name: Vet
+        shell: bash
+        run: go vet ./...
+
+      # 在 Linux/macOS 上跑 race detector；Windows 跳过（race 在 Windows
+      # 需要 cgo，innerlink 红线要求核心层无 cgo，所以 CI 这层也不引入）。
+      - name: Test with race detector
+        if: runner.os != 'Windows'
+        shell: bash
+        run: go test -race -v -coverprofile=coverage.out ./...
+
+      - name: Test
+        if: runner.os == 'Windows'
+        shell: bash
+        run: go test -v -coverprofile=coverage.out ./...
+
+      - name: Upload coverage
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+
+      - name: Build all packages
+        shell: bash
+        run: go build -v ./...
+
+  # -------------------------------------------------------------------------
+  # Release：打 tag 时触发，6 个平台二进制
+  # -------------------------------------------------------------------------
+  release:
+    name: Release ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ${{ matrix.goos }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+          - goos: windows
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          mkdir -p dist
+          EXT=""
+          if [ "$GOOS" = "windows" ]; then EXT=".exe"; fi
+          go build \
+            -trimpath \
+            -ldflags="-s -w -X main.version=${GITHUB_REF_NAME#v}" \
+            -o "dist/innerlink-${GOOS}-${GOARCH}${EXT}" \
+            ./cmd/innerlink
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: innerlink-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/innerlink-${{ matrix.goos }}-${{ matrix.goarch }}*
+          if-no-files-found: error
+
+  # -------------------------------------------------------------------------
+  # 创建 GitHub Release
+  # -------------------------------------------------------------------------
+  github-release:
+    name: GitHub Release
+    needs: release
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
+          draft: false
+          prerelease: false
