@@ -86,3 +86,32 @@ If you ever change the heartbeat marker, update both the
 writer (transport.heartbeatOnce) and the filter (transport
 .isHeartbeat) in lockstep — there's a unit test for the
 filter.
+
+## MaxEnvelopeSize must fit one file chunk post-base64 (踩过的坑)
+
+`protocol.MaxEnvelopeSize` caps the post-decryption envelope
+size (i.e. the inner JSON). 1 MiB raw bytes become ~1.4 MiB
+after base64 encoding (the `json.Marshal` of an `[]byte` payload
+auto-encodes as base64). If MaxEnvelopeSize is 1 MiB the
+receiver rejects any 1 MiB file chunk as "frame too large".
+
+Rule: MaxEnvelopeSize ≥ ceil(ChunkSize * 4/3) + headroom.
+Currently ChunkSize = 1 MiB and MaxEnvelopeSize = 4 MiB
+(~2.6 MiB headroom for JSON keys, Envelope struct fields, etc.).
+
+If you ever lower MaxEnvelopeSize, lower ChunkSize first.
+If you ever raise ChunkSize, raise MaxEnvelopeSize first.
+
+## `protocol.Channel.Send` is exported — don't shadow it (踩过的坑)
+
+`Channel.send` (lowercase) is the unexported workhorse that
+fills in From/TS/MsgID/Version and does the encryption. v0.1
+added `Channel.Send(ctx, Envelope)` (uppercase) as the
+public API used by `internal/filetransfer` to send non-chat
+envelopes (file offers/chunks/etc.). Chat uses the convenience
+methods (`SendText`, `SendPing`); file transfer uses `Send`.
+
+If you add a new message type to the protocol layer, prefer
+adding it via the public `Send` rather than calling `send`
+directly — otherwise From/TS/MsgID/Version get skipped and
+the receiver drops the envelope as malformed.

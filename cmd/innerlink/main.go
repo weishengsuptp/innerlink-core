@@ -287,8 +287,21 @@ func wrapChannel(ctx context.Context, conn *transport.Conn, sess *handshake.Sess
 	}
 	log.Printf("[INFO ] channel ready peer=%s", peerHex(sess.RemotePeerID))
 
-	// Chat pump. Drops non-chat envelopes — file traffic is
-	// owned by the Receiver below.
+	// Single-pump dispatch loop. Channel.Recv is NOT safe to
+	// call from multiple goroutines on the same Channel, so we
+	// do exactly one Recv and route the envelope to the right
+	// handler (chat or filetransfer) based on type.
+	peerHexStr := peerHex(sess.RemotePeerID)
+	rcv, err := filetransfer.NewReceiver(ch, saveDir, func(o filetransfer.FileOffer, _ string) error {
+		log.Printf("[FILE] incoming peer=%s name=%q size=%d from=%s",
+			peerHexStr, o.Name, o.Size, peerHexStr)
+		return nil // accept everything by default
+	}, peerHexStr)
+	if err != nil {
+		log.Printf("[ERROR] filetransfer receiver for %s: %v", peerHexStr, err)
+		_ = ch.Close()
+		return
+	}
 	go func() {
 		defer reg.delete(sess.RemotePeerID)
 		for {
@@ -297,41 +310,22 @@ func wrapChannel(ctx context.Context, conn *transport.Conn, sess *handshake.Sess
 			}
 			env, err := ch.Recv(ctx)
 			if err != nil {
-				log.Printf("[INFO ] channel closed peer=%s (%v)", peerHex(sess.RemotePeerID), err)
+				log.Printf("[INFO ] channel closed peer=%s (%v)", peerHexStr, err)
 				return
 			}
 			switch env.Type {
 			case protocol.TypeText:
-				log.Printf("[MSG  ] in  <%s> %s", peerHex(sess.RemotePeerID), string(env.Payload))
+				log.Printf("[MSG  ] in  <%s> %s", peerHexStr, string(env.Payload))
 			case protocol.TypePing:
-				log.Printf("[MSG  ] in  <%s> ping", peerHex(sess.RemotePeerID))
+				log.Printf("[MSG  ] in  <%s> ping", peerHexStr)
 				_ = ch.SendPing(ctx) // pong
 			case protocol.TypePong:
 				// ignore for v0.1
+			default:
+				// File traffic and anything else: let the
+				// file receiver own it.
+				rcv.Handle(ctx, env)
 			}
-		}
-	}()
-
-	// File receiver. Each Channel gets its own Receiver; they
-	// read from the same ch.Recv in a separate goroutine, so
-	// chat + file coexist on the same Channel.
-	peerHexStr := peerHex(sess.RemotePeerID)
-	go func() {
-		rcv, err := filetransfer.NewReceiver(ch, saveDir, func(o filetransfer.FileOffer, _ string) error {
-			log.Printf("[FILE] incoming peer=%s name=%q size=%d from=%s",
-				peerHexStr, o.Name, o.Size, peerHexStr)
-			return nil // accept everything by default
-		}, peerHexStr)
-		if err != nil {
-			log.Printf("[ERROR] filetransfer receiver for %s: %v", peerHexStr, err)
-			return
-		}
-		// Receiver.Loop reads non-stop; chat pump owns the
-		// other half. When the chat pump's Recv returns an
-		// error, this one will too because they share the
-		// underlying conn.
-		if err := rcv.Loop(ctx); err != nil && ctx.Err() == nil {
-			log.Printf("[FILE] receiver closed peer=%s (%v)", peerHexStr, err)
 		}
 	}()
 }

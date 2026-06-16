@@ -82,6 +82,11 @@ func NewReceiver(ch *protocol.Channel, saveDir string, onOffer OnOffer, fromPeer
 // or the channel is closed. Any chat/text/ping traffic is
 // silently dropped — the chat pump is a separate goroutine.
 //
+// IMPORTANT: a single Channel must have exactly ONE goroutine
+// calling Channel.Recv at a time. If you also need a chat
+// pump on the same channel, use Handle() and dispatch from
+// your own pump loop instead of calling Loop().
+//
 // The actual file-data path is: receive offer → maybe accept
 // → stream chunks to disk → verify → send Done.
 func (r *Receiver) Loop(ctx context.Context) error {
@@ -93,21 +98,30 @@ func (r *Receiver) Loop(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		switch env.Type {
-		case protocol.TypeFileOffer:
-			r.handleOffer(ctx, env)
-		case protocol.TypeFileChunk:
-			r.handleChunk(ctx, env)
-		case protocol.TypeFileAbort:
-			// From a sender that gives up. Clean up our temp
-			// file if any.
-			var a FileAbort
-			if err := json.Unmarshal(env.Payload, &a); err == nil {
-				r.abort(a.FileID, a.Reason)
-			}
-		default:
-			// Not for us. Drop.
+		r.Handle(ctx, env)
+	}
+}
+
+// Handle dispatches one envelope to the receiver. Use this
+// from a single-pump dispatch loop (see cmd/innerlink) when
+// chat and file traffic share the same Channel. The receiver
+// owns the Envelopes of file types (Offer / Chunk / Abort);
+// all other types are silently dropped.
+func (r *Receiver) Handle(ctx context.Context, env protocol.Envelope) {
+	switch env.Type {
+	case protocol.TypeFileOffer:
+		r.handleOffer(ctx, env)
+	case protocol.TypeFileChunk:
+		r.handleChunk(ctx, env)
+	case protocol.TypeFileAbort:
+		// From a sender that gives up. Clean up our temp
+		// file if any.
+		var a FileAbort
+		if err := json.Unmarshal(env.Payload, &a); err == nil {
+			r.abort(a.FileID, a.Reason)
 		}
+	default:
+		// Not for us. Drop.
 	}
 }
 
