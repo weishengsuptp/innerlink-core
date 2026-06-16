@@ -58,13 +58,33 @@ type FileAbort struct {
 // a progress bar. The sender does not block on this callback.
 type ProgressFn func(sent, total int64)
 
+// WaitForReplyFunc is the dispatcher-aware way to wait for a
+// file-reply envelope. The filetransfer package cannot call
+// ch.Recv directly when a separate goroutine (the cmd/innerlink
+// chat pump) is also reading from the same channel, because the
+// two readers race and the chat pump would silently swallow
+// the Accept / Done envelope that Send is waiting for. Instead,
+// the caller supplies a function that, given (ctx, wantType,
+// fileID), blocks until the matching envelope arrives at the
+// dispatcher's Handle() callback. Receiver.WaitForReply is the
+// canonical implementation.
+type WaitForReplyFunc func(ctx context.Context, wantType protocol.MsgType, fileID string) (protocol.Envelope, error)
+
 // Send streams the file at path to the peer reachable through
 // the given protocol.Channel. It blocks until the receiver
 // acknowledges Done, the transfer is aborted, or ctx fires.
 //
 // On success, the file's SHA-256 has been verified by the
 // receiver. Send returns nil only after that ack.
-func Send(ctx context.Context, ch *protocol.Channel, path string, progress ProgressFn) error {
+//
+// waitForReply is required when ch is shared with another
+// goroutine that calls ch.Recv. Pass nil only if Send is the
+// sole reader of ch.Recv (e.g. in a file-only loopback test
+// where the cmd dispatcher pattern is not in use).
+func Send(ctx context.Context, ch *protocol.Channel, path string, progress ProgressFn, waitForReply WaitForReplyFunc) error {
+	if waitForReply == nil {
+		waitForReply = defaultWaitForReply(ch)
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("filetransfer: open: %w", err)
@@ -106,7 +126,7 @@ func Send(ctx context.Context, ch *protocol.Channel, path string, progress Progr
 
 	// 2) Wait for Accept. The receiver may take a moment to
 	//    decide (UI prompt, disk check, etc.).
-	acceptRaw, err := recvFileFrame(ctx, ch, offer.FileID, protocol.TypeFileAccept)
+	acceptRaw, err := recvFileFrame(ctx, ch, offer.FileID, protocol.TypeFileAccept, waitForReply)
 	if err != nil {
 		return fmt.Errorf("filetransfer: wait accept: %w", err)
 	}
@@ -166,7 +186,7 @@ func Send(ctx context.Context, ch *protocol.Channel, path string, progress Progr
 	}
 
 	// 4) Wait for Done.
-	doneRaw, err := recvFileFrame(ctx, ch, offer.FileID, protocol.TypeFileDone)
+	doneRaw, err := recvFileFrame(ctx, ch, offer.FileID, protocol.TypeFileDone, waitForReply)
 	if err != nil {
 		return fmt.Errorf("filetransfer: wait done: %w", err)
 	}
@@ -203,48 +223,71 @@ func sendJSON(ctx context.Context, ch *protocol.Channel, t protocol.MsgType, pay
 	})
 }
 
-// recvFileFrame blocks on ch.Recv until an Envelope of the
-// expected type and fileID arrives, or ctx fires. Any envelope
-// of a different type or fileID is silently dropped (other
-// transfers / chat can be multiplexed on the same channel).
+// recvFileFrame blocks until an Envelope of the expected type
+// and fileID arrives at the dispatcher-aware wait function, or
+// ctx fires. This deliberately does NOT call ch.Recv directly,
+// because the dispatcher's chat pump is the one goroutine that
+// reads from the channel. If Send called ch.Recv too, the
+// dispatcher would silently swallow Accept / Done envelopes as
+// "non-file traffic" and Send would deadlock.
 //
 // If a TypeFileAbort for our fileID arrives while we wait, we
 // return immediately with a typed error.
-func recvFileFrame(ctx context.Context, ch *protocol.Channel, fileID string, want protocol.MsgType) (protocol.Envelope, error) {
-	for {
-		if err := ctx.Err(); err != nil {
-			return protocol.Envelope{}, err
-		}
-		env, err := ch.Recv(ctx)
-		if err != nil {
-			return protocol.Envelope{}, err
-		}
-		// Aborts interrupt the wait regardless of what we
-		// were waiting for. Match by fileID so a different
-		// transfer's abort doesn't poison us.
-		if env.Type == protocol.TypeFileAbort {
-			if envelopeMatchesFileID(env, fileID) {
-				var a FileAbort
-				_ = json.Unmarshal(env.Payload, &a)
-				return protocol.Envelope{}, fmt.Errorf("filetransfer: aborted by peer: %s", a.Reason)
+func recvFileFrame(ctx context.Context, ch *protocol.Channel, fileID string, want protocol.MsgType, waitForReply WaitForReplyFunc) (protocol.Envelope, error) {
+	env, err := waitForReply(ctx, want, fileID)
+	if err != nil {
+		return protocol.Envelope{}, err
+	}
+	// Defensive: verify the envelope we got is actually for
+	// us. A buggy dispatcher could route the wrong envelope.
+	if env.Type == protocol.TypeFileAbort && envelopeMatchesFileID(env, fileID) {
+		var a FileAbort
+		_ = json.Unmarshal(env.Payload, &a)
+		return protocol.Envelope{}, fmt.Errorf("filetransfer: aborted by peer: %s", a.Reason)
+	}
+	if env.Type != want {
+		return protocol.Envelope{}, fmt.Errorf("filetransfer: unexpected reply type %v (wanted %v)", env.Type, want)
+	}
+	if !envelopeMatchesFileID(env, fileID) {
+		return protocol.Envelope{}, fmt.Errorf("filetransfer: reply fileID mismatch")
+	}
+	return env, nil
+}
+
+// defaultWaitForReply is used when the caller passes nil to
+// Send. It calls ch.Recv directly. This is the right choice
+// when no other goroutine is reading from ch (e.g. the
+// file-only test paths), and the wrong choice in the cmd/
+// innerlink CLI where the dispatcher pump is also reading.
+func defaultWaitForReply(ch *protocol.Channel) WaitForReplyFunc {
+	return func(ctx context.Context, want protocol.MsgType, fileID string) (protocol.Envelope, error) {
+		for {
+			if err := ctx.Err(); err != nil {
+				return protocol.Envelope{}, err
 			}
-			continue
+			env, err := ch.Recv(ctx)
+			if err != nil {
+				return protocol.Envelope{}, err
+			}
+			// Abort always short-circuits the wait —
+			// match by fileID so a different transfer's
+			// abort doesn't poison us.
+			if env.Type == protocol.TypeFileAbort {
+				if envelopeMatchesFileID(env, fileID) {
+					return env, nil
+				}
+				continue
+			}
+			if env.Type == want && envelopeMatchesFileID(env, fileID) {
+				return env, nil
+			}
+			// Drop the noise (chat, ping, wrong fileID).
+			// Note: in this default path, the caller is
+			// the sole reader, so there is no other pump
+			// to consume what we drop. This is OK for
+			// tests; the cmd/innerlink CLI must NOT use
+			// the default path.
 		}
-		if env.Type != want {
-			// Could be chat from the other side, or a chunk
-			// from a different transfer. Drop it; the caller
-			// of Send does not care about non-file traffic
-			// and the Receiver goroutine is the one that
-			// would normally handle those.
-			continue
-		}
-		// Best-effort: every payload we care about carries a
-		// "fileID" string; if it's missing or mismatched, the
-		// envelope is for someone else.
-		if !envelopeMatchesFileID(env, fileID) {
-			continue
-		}
-		return env, nil
 	}
 }
 

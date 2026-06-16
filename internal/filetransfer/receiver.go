@@ -11,6 +11,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/weishengsuptp/innerlink-core/internal/protocol"
@@ -41,13 +42,41 @@ type Receiver struct {
 	saveDir  string
 	onOffer  OnOffer
 	fromPeer string
-
 	// in-memory state for resume support. In v0.1 we keep this
 	// for the lifetime of a single Receiver instance, so a
 	// partial transfer can be resumed if the channel comes
 	// back up before Receiver is stopped. Persisting this
 	// across restarts is a v0.3 feature.
 	partFiles map[string]*partFile // key = fileID
+	// replyWaiters is a registry of goroutines blocked inside
+	// Sender.Send waiting for the matching Accept / Done /
+	// Abort envelope. The dispatcher pump on the cmd/innerlink
+	// CLI is the one goroutine that actually reads envelopes
+	// from the channel, so file Send and file Receive both
+	// share a single Recv path. The Receiver owns this
+	// registry because it is the one already inside Handle()
+	// when an Accept/Done envelope arrives; it forwards the
+	// envelope to whichever Send() is waiting on it.
+	//
+	// Keys are "<wantType>:<fileID>" so a sender waiting for
+	// Accept and a different sender waiting for Done on the
+	// same fileID don't collide.
+	replyWaiters map[string]chan<- protocol.Envelope
+	// pendingReplies caches reply envelopes that arrived
+	// before their corresponding WaitForReply registration
+	// — e.g. the receiver emits Accept as soon as it
+	// receives Offer, which can happen before the sender
+	// has called WaitForReply(ctx, TypeFileAccept, fileID).
+	// Without this cache, the Accept would be dropped and
+	// the sender would block on wait accept until ctx
+	// timeout.
+	//
+	// Only one envelope is cached per (wantType, fileID)
+	// key — the most recent reply wins. (In v0.1 each
+	// fileID has at most one Accept and one Done, so there
+	// is no real "most recent" ambiguity.)
+	pendingReplies map[string]protocol.Envelope
+	replyMu        sync.Mutex
 }
 
 type partFile struct {
@@ -72,11 +101,13 @@ func NewReceiver(ch *protocol.Channel, saveDir string, onOffer OnOffer, fromPeer
 		return nil, fmt.Errorf("filetransfer: mkdir incoming: %w", err)
 	}
 	return &Receiver{
-		ch:        ch,
-		saveDir:   saveDir,
-		onOffer:   onOffer,
-		fromPeer:  fromPeer,
-		partFiles: make(map[string]*partFile),
+		ch:             ch,
+		saveDir:        saveDir,
+		onOffer:        onOffer,
+		fromPeer:       fromPeer,
+		partFiles:      make(map[string]*partFile),
+		replyWaiters:   make(map[string]chan<- protocol.Envelope),
+		pendingReplies: make(map[string]protocol.Envelope),
 	}, nil
 }
 
@@ -110,20 +141,143 @@ func (r *Receiver) Loop(ctx context.Context) error {
 // owns the Envelopes of file types (Offer / Chunk / Abort);
 // all other types are silently dropped.
 func (r *Receiver) Handle(ctx context.Context, env protocol.Envelope) {
+	// Accept / Done / Abort envelopes are replies to a
+	// Sender blocked in Send(). Forward them to the
+	// registered waiter so the sender's wait loop can
+	// continue. This is the only correct way to do file
+	// transfer on a channel that is also being read by a
+	// dispatcher pump — the dispatcher reads every envelope,
+	// so the sender cannot also call ch.Recv directly (it
+	// would race the dispatcher for Accept and the dispatcher
+	// would silently drop Accept as "non-file traffic").
+	if env.Type == protocol.TypeFileAccept ||
+		env.Type == protocol.TypeFileDone ||
+		env.Type == protocol.TypeFileAbort {
+		// Extract the fileID from the payload so we can
+		// route to the correct waiter. For TypeFileAbort
+		// we also want to clean up the part file.
+		var fileID string
+		switch env.Type {
+		case protocol.TypeFileAccept:
+			var a FileAccept
+			_ = json.Unmarshal(env.Payload, &a)
+			fileID = a.FileID
+		case protocol.TypeFileDone:
+			var d FileDone
+			_ = json.Unmarshal(env.Payload, &d)
+			fileID = d.FileID
+		case protocol.TypeFileAbort:
+			var a FileAbort
+			_ = json.Unmarshal(env.Payload, &a)
+			fileID = a.FileID
+			// Also clean up our temp file if any.
+			r.abort(a.FileID, a.Reason)
+		}
+		if fileID != "" {
+			r.deliverReply(env.Type, fileID, env)
+		}
+		// For Done/Abort the receiver-side Handle path
+		// still wants to react (cleanup, etc.). For Accept
+		// there is no per-receiver action in v0.1; the
+		// sender has already moved on to sending chunks.
+		if env.Type == protocol.TypeFileDone {
+			var d FileDone
+			_ = json.Unmarshal(env.Payload, &d)
+			if d.OK {
+				_ = d.FileID // success log only — keep noise down
+			}
+		}
+		return
+	}
 	switch env.Type {
 	case protocol.TypeFileOffer:
 		r.handleOffer(ctx, env)
 	case protocol.TypeFileChunk:
 		r.handleChunk(ctx, env)
-	case protocol.TypeFileAbort:
-		// From a sender that gives up. Clean up our temp
-		// file if any.
-		var a FileAbort
-		if err := json.Unmarshal(env.Payload, &a); err == nil {
-			r.abort(a.FileID, a.Reason)
-		}
 	default:
 		// Not for us. Drop.
+	}
+}
+
+// WaitForReply blocks until an envelope of want type for
+// fileID arrives at Handle, or ctx fires. The dispatcher
+// (the one goroutine reading from ch.Recv) must call Handle
+// for this to work — otherwise the envelope never reaches
+// us and we deadlock.
+//
+// One waiter per (wantType, fileID) pair. The caller (Send)
+// registers, reads the envelope, then unregisters. If ctx
+// fires before the envelope arrives, the unregister still
+// happens (via defer) so we don't leak a registered channel.
+func (r *Receiver) WaitForReply(ctx context.Context, wantType protocol.MsgType, fileID string) (protocol.Envelope, error) {
+	key := replyKey(wantType, fileID)
+	// First check the pending-reply cache: an Accept
+	// envelope may have arrived at Handle() before we
+	// got here (Receiver's handleOffer replies
+	// synchronously, so the Accept can be in the pipe
+	// before Send calls WaitForReply). If we find a
+	// cached envelope, return it without ever blocking.
+	r.replyMu.Lock()
+	if cached, ok := r.pendingReplies[key]; ok {
+		delete(r.pendingReplies, key)
+		r.replyMu.Unlock()
+		return cached, nil
+	}
+	ch := make(chan protocol.Envelope, 1)
+	r.replyWaiters[key] = ch
+	r.replyMu.Unlock()
+	defer func() {
+		r.replyMu.Lock()
+		if w, ok := r.replyWaiters[key]; ok && w == ch {
+			delete(r.replyWaiters, key)
+		}
+		// Drain the cache on the way out so a later
+		// WaitForReply on the same key starts clean.
+		delete(r.pendingReplies, key)
+		r.replyMu.Unlock()
+		close(ch)
+	}()
+	select {
+	case env, ok := <-ch:
+		if !ok {
+			return protocol.Envelope{}, ctx.Err()
+		}
+		return env, nil
+	case <-ctx.Done():
+		return protocol.Envelope{}, ctx.Err()
+	}
+}
+
+func replyKey(wantType protocol.MsgType, fileID string) string {
+	return string(wantType) + ":" + fileID
+}
+
+func (r *Receiver) deliverReply(wantType protocol.MsgType, fileID string, env protocol.Envelope) {
+	key := replyKey(wantType, fileID)
+	r.replyMu.Lock()
+	ch := r.replyWaiters[key]
+	if ch == nil {
+		// No live waiter. The reply arrived before
+		// WaitForReply was called (e.g. the receiver
+		// emits Accept synchronously from
+		// handleOffer, so the Accept is on the wire
+		// before the sender has even called
+		// WaitForReply). Cache it; the next
+		// WaitForReply on this key will pick it up.
+		r.pendingReplies[key] = env
+		r.replyMu.Unlock()
+		return
+	}
+	r.replyMu.Unlock()
+	// Non-blocking send: if the waiter already gave up
+	// (ctx done) it has closed the channel; we must not
+	// panic. The defer in WaitForReply has already removed
+	// the waiter from the map, so this branch should be
+	// rare. Use a recover for safety.
+	defer func() { _ = recover() }()
+	select {
+	case ch <- env:
+	default:
 	}
 }
 

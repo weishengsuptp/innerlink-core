@@ -150,36 +150,48 @@ func run() error {
 // channelRegistry tracks the active encrypted Channels, keyed
 // by remote PeerID. Used so the stdin loop and the receive
 // goroutine can find the right Channel to talk to.
+//
+// We also keep a per-channel Receiver so that sendFile can ask
+// the Receiver to be its dispatcher-aware wait channel. This
+// is the fix for the "sendfile silently hangs because the chat
+// pump's Recv swallowed the Accept envelope" race: the Sender
+// must not call ch.Recv directly when the dispatcher is also
+// reading from the channel.
+type channelState struct {
+	ch  *protocol.Channel
+	rcv *filetransfer.Receiver
+}
+
 type channelRegistry struct {
 	mu sync.Mutex
-	m  map[string]*protocol.Channel
+	m  map[string]*channelState
 }
 
 func newChannelRegistry() *channelRegistry {
-	return &channelRegistry{m: make(map[string]*protocol.Channel)}
+	return &channelRegistry{m: make(map[string]*channelState)}
 }
 
-// set installs ch for peerID. If a Channel already exists for
+// set installs state for peerID. If a Channel already exists for
 // this peer, set() closes the new one and returns the existing
 // one — the assumption is that the existing Channel was set up
 // first and is in active use, and a concurrent re-handshake
 // (caused by the announcer's periodic PeerAdded emissions) is
 // the redundant one we want to drop.
 //
-// Returns true if ch was installed, false if the existing one
+// Returns true if state was installed, false if the existing one
 // was kept.
-func (r *channelRegistry) set(peerID []byte, ch *protocol.Channel) bool {
+func (r *channelRegistry) set(peerID []byte, st *channelState) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	key := string(peerID)
 	if _, ok := r.m[key]; ok {
 		return false
 	}
-	r.m[key] = ch
+	r.m[key] = st
 	return true
 }
 
-func (r *channelRegistry) get(peerID []byte) *protocol.Channel {
+func (r *channelRegistry) get(peerID []byte) *channelState {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.m[string(peerID)]
@@ -188,8 +200,8 @@ func (r *channelRegistry) get(peerID []byte) *protocol.Channel {
 func (r *channelRegistry) delete(peerID []byte) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if ch, ok := r.m[string(peerID)]; ok {
-		_ = ch.Close()
+	if st, ok := r.m[string(peerID)]; ok {
+		_ = st.ch.Close()
 		delete(r.m, string(peerID))
 	}
 }
@@ -197,8 +209,8 @@ func (r *channelRegistry) delete(peerID []byte) {
 func (r *channelRegistry) closeAll() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	for _, ch := range r.m {
-		_ = ch.Close()
+	for _, st := range r.m {
+		_ = st.ch.Close()
 	}
 	r.m = nil
 }
@@ -276,17 +288,6 @@ func wrapChannel(ctx context.Context, conn *transport.Conn, sess *handshake.Sess
 		_ = conn.Close()
 		return
 	}
-	if !reg.set(sess.RemotePeerID, ch) {
-		// Race lost: another Channel for this peer was installed
-		// first. Close this one and bail without starting the
-		// Recv goroutine — the winner's goroutine already owns
-		// receive for this peer.
-		log.Printf("[INFO ] channel superseded peer=%s (keeping existing)", peerHex(sess.RemotePeerID))
-		_ = ch.Close()
-		return
-	}
-	log.Printf("[INFO ] channel ready peer=%s", peerHex(sess.RemotePeerID))
-
 	// Single-pump dispatch loop. Channel.Recv is NOT safe to
 	// call from multiple goroutines on the same Channel, so we
 	// do exactly one Recv and route the envelope to the right
@@ -302,6 +303,16 @@ func wrapChannel(ctx context.Context, conn *transport.Conn, sess *handshake.Sess
 		_ = ch.Close()
 		return
 	}
+	if !reg.set(sess.RemotePeerID, &channelState{ch: ch, rcv: rcv}) {
+		// Race lost: another Channel for this peer was installed
+		// first. Close this one and bail without starting the
+		// Recv goroutine — the winner's goroutine already owns
+		// receive for this peer.
+		log.Printf("[INFO ] channel superseded peer=%s (keeping existing)", peerHexStr)
+		_ = ch.Close()
+		return
+	}
+	log.Printf("[INFO ] channel ready peer=%s", peerHexStr)
 	go func() {
 		defer reg.delete(sess.RemotePeerID)
 		for {
@@ -323,7 +334,11 @@ func wrapChannel(ctx context.Context, conn *transport.Conn, sess *handshake.Sess
 				// ignore for v0.1
 			default:
 				// File traffic and anything else: let the
-				// file receiver own it.
+				// file receiver own it. Handle() is also
+				// the dispatch point for the Sender's
+				// wait channel — Accept / Done / Abort
+				// envelopes get routed to whichever
+				// Sender.Send() is blocked on WaitForReply.
 				rcv.Handle(ctx, env)
 			}
 		}
@@ -401,12 +416,12 @@ func sendTo(reg *channelRegistry, peerHex, text string) {
 		log.Printf("[ERROR] bad peer id hex: %v", err)
 		return
 	}
-	ch := reg.get(pid)
-	if ch == nil {
+	st := reg.get(pid)
+	if st == nil {
 		log.Printf("[ERROR] no active channel for peer %s", peerHex)
 		return
 	}
-	if err := ch.SendText(context.Background(), text); err != nil {
+	if err := st.ch.SendText(context.Background(), text); err != nil {
 		log.Printf("[ERROR] send: %v", err)
 		return
 	}
@@ -422,8 +437,8 @@ func sendFile(reg *channelRegistry, peerHex, path string) {
 		log.Printf("[ERROR] bad peer id hex: %v", err)
 		return
 	}
-	ch := reg.get(pid)
-	if ch == nil {
+	st := reg.get(pid)
+	if st == nil {
 		log.Printf("[ERROR] no active channel for peer %s", peerHex)
 		return
 	}
@@ -436,7 +451,7 @@ func sendFile(reg *channelRegistry, peerHex, path string) {
 			path, peerHex, sent, total, pct)
 	}
 	log.Printf("[FILE] start send peer=%s path=%s", peerHex, path)
-	if err := filetransfer.Send(context.Background(), ch, path, progress); err != nil {
+	if err := filetransfer.Send(context.Background(), st.ch, path, progress, st.rcv.WaitForReply); err != nil {
 		log.Printf("[ERROR] sendfile: %v", err)
 		return
 	}
@@ -449,12 +464,12 @@ func pingPeer(reg *channelRegistry, peerHex string) {
 		log.Printf("[ERROR] bad peer id hex: %v", err)
 		return
 	}
-	ch := reg.get(pid)
-	if ch == nil {
+	st := reg.get(pid)
+	if st == nil {
 		log.Printf("[ERROR] no active channel for peer %s", peerHex)
 		return
 	}
-	_ = ch.SendPing(context.Background())
+	_ = st.ch.SendPing(context.Background())
 	log.Printf("[MSG  ] out >%s> ping", peerHex)
 }
 

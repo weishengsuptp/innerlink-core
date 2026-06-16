@@ -62,7 +62,7 @@ func TestHandleDispatch(t *testing.T) {
 	// Give the chat message a moment to land.
 	time.Sleep(50 * time.Millisecond)
 
-	if err := ft.Send(rctx, chA, srcPath, nil); err != nil {
+	if err := ft.Send(rctx, chA, srcPath, nil, nil); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 

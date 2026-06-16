@@ -142,7 +142,7 @@ func TestSendSmallFile(t *testing.T) {
 	if err := ft.Send(context.Background(), chA, srcPath, func(sent, total int64) {
 		progressCalls++
 		lastSent = sent
-	}); err != nil {
+	}, nil); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 	if lastSent != 64*1024 {
@@ -202,7 +202,7 @@ func TestSendMultiChunk(t *testing.T) {
 		t.Logf("[recv] Loop returned: %v", err)
 	}()
 
-	if err := ft.Send(context.Background(), chA, srcPath, nil); err != nil {
+	if err := ft.Send(context.Background(), chA, srcPath, nil, nil); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 
@@ -254,7 +254,7 @@ func TestReceiverRejectsOffer(t *testing.T) {
 	defer rcancel()
 	go func() { _ = rcv.Loop(rctx) }()
 
-	err = ft.Send(context.Background(), chA, srcPath, nil)
+	err = ft.Send(context.Background(), chA, srcPath, nil, nil)
 	if err == nil {
 		t.Fatal("Send should have failed when receiver rejected offer")
 	}
@@ -288,7 +288,7 @@ func TestSendUnalignedLastChunk(t *testing.T) {
 	defer rcancel()
 	go func() { _ = rcv.Loop(rctx) }()
 
-	if err := ft.Send(context.Background(), chA, srcPath, nil); err != nil {
+	if err := ft.Send(context.Background(), chA, srcPath, nil, nil); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 
