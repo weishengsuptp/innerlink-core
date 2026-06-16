@@ -1,0 +1,231 @@
+// Package protocol implements the encrypted application-layer
+// message format that innerlink peers exchange after a successful
+// handshake.
+//
+// What it does, in one sentence:
+// each application message is wrapped in an Envelope, serialized
+// to JSON, encrypted with SM4-GCM (using the SM4 session key from
+// internal/handshake), and sent over a transport.Conn as a single
+// frame.
+//
+// What it does NOT do:
+//   - Transport: see internal/transport.
+//   - Identity / key agreement: see internal/handshake.
+//   - File transfer: that uses its own chunking on top of this
+//     layer (see internal/filetransfer, v0.1 follow-up).
+//
+// On-wire format:
+//
+//	+--------+--------+---------------------+
+//	| nonce  |  ct+tag|       ...           |
+//	| 12 B   |  ...   |       ...           |
+//	+--------+--------+---------------------+
+//	\_________________  _________________/
+//	                  \/
+//	    SM4-GCM(SessionKey, nonce, AAD=msgID, plaintext=JSON(envelope))
+//
+// The Envelope is JSON, not Protobuf, for v0.1. The serialized
+// JSON form is the input to SM4-GCM (the envelope never appears
+// on the wire in cleartext). v0.2 migrates to Protobuf.
+package protocol
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+
+	ic "github.com/weishengsuptp/innerlink-core/internal/crypto"
+	"github.com/weishengsuptp/innerlink-core/internal/handshake"
+	"github.com/weishengsuptp/innerlink-core/internal/transport"
+)
+
+// ProtocolVersion is the envelope version baked into every message.
+// Bumped if the wire format changes incompatibly.
+const ProtocolVersion = 1
+
+// MaxEnvelopeSize caps the post-decryption envelope size. Generous
+// because chat messages are small; if a peer sends a 1 MB envelope
+// it's almost certainly broken (or malicious).
+const MaxEnvelopeSize = 1 << 20 // 1 MiB
+
+// MsgType enumerates the message kinds we know about today.
+type MsgType string
+
+const (
+	// TypeText is a 1:1 chat message. Payload is a UTF-8 string.
+	TypeText MsgType = "text"
+	// TypePing is a liveness probe; payload is empty. Reply with TypePong.
+	TypePing MsgType = "ping"
+	// TypePong is the response to TypePing.
+	TypePong MsgType = "pong"
+	// TypeAck acknowledges receipt of a message by msgID. Useful
+	// for at-least-once delivery semantics in v0.2; v0.1 sends it
+	// but doesn't yet use it for anything.
+	TypeAck MsgType = "ack"
+)
+
+// Envelope is the application-level message structure that gets
+// encrypted before transmission. See package doc for the on-wire
+// encoding.
+type Envelope struct {
+	Version uint8     `json:"v"`   // ProtocolVersion
+	Type    MsgType   `json:"t"`   // one of TypeText/Ping/Pong/Ack
+	From    []byte    `json:"f"`   // 16 bytes (sender's PeerID)
+	TS      int64     `json:"ts"`  // unix milliseconds
+	MsgID   []byte    `json:"mid"` // 8 bytes, random per message
+	Payload []byte    `json:"p"`   // type-specific (for text: utf-8 string bytes)
+}
+
+// Channel is a single encrypted message stream between two peers.
+// It is created after a successful handshake; from then on Send
+// and Recv transparently encrypt/decrypt.
+type Channel struct {
+	conn       *transport.Conn
+	session    *handshake.Session
+	remotePeer []byte // 16 bytes, copy of session.RemotePeerID
+}
+
+// NewChannel wraps a transport.Conn that has just completed the
+// handshake. The Channel takes ownership of the Conn; callers
+// should not use conn directly after this.
+func NewChannel(conn *transport.Conn, session *handshake.Session) (*Channel, error) {
+	if conn == nil {
+		return nil, errors.New("protocol: nil conn")
+	}
+	if session == nil {
+		return nil, errors.New("protocol: nil session")
+	}
+	if len(session.SessionKey) != handshake.SessionKeySize {
+		return nil, fmt.Errorf("protocol: bad session key length %d, want %d",
+			len(session.SessionKey), handshake.SessionKeySize)
+	}
+	remote := make([]byte, len(session.RemotePeerID))
+	copy(remote, session.RemotePeerID)
+	return &Channel{
+		conn:       conn,
+		session:    session,
+		remotePeer: remote,
+	}, nil
+}
+
+// RemotePeerID returns a defensive copy of the 16-byte peer ID
+// of the other end of this channel.
+func (c *Channel) RemotePeerID() []byte {
+	out := make([]byte, len(c.remotePeer))
+	copy(out, c.remotePeer)
+	return out
+}
+
+// Close shuts down the underlying conn.
+func (c *Channel) Close() error {
+	return c.conn.Close()
+}
+
+// SendText is the convenience method for sending a chat message.
+func (c *Channel) SendText(ctx context.Context, text string) error {
+	return c.send(ctx, Envelope{
+		Type:    TypeText,
+		Payload: []byte(text),
+	})
+}
+
+// SendPing sends a liveness probe.
+func (c *Channel) SendPing(ctx context.Context) error {
+	return c.send(ctx, Envelope{Type: TypePing})
+}
+
+// send is the internal workhorse. Builds an Envelope (filling in
+// From, TS, MsgID, Version), JSON-encodes it, SM4-GCM-encrypts
+// the result, and writes a single transport frame to conn.
+func (c *Channel) send(ctx context.Context, env Envelope) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	env.Version = ProtocolVersion
+	if env.From == nil {
+		env.From = c.localPeerID() // we don't currently know our own
+		// PeerID at the Channel layer; leave blank if unknown. The
+		// recipient verifies identity at the handshake layer; the
+		// envelope's From field is informational.
+	}
+	if env.TS == 0 {
+		env.TS = time.Now().UnixMilli()
+	}
+	if env.MsgID == nil {
+		id, err := ic.NewNonce(8)
+		if err != nil {
+			return fmt.Errorf("protocol: gen msgID: %w", err)
+		}
+		env.MsgID = id
+	}
+	plain, err := json.Marshal(env)
+	if err != nil {
+		return fmt.Errorf("protocol: marshal envelope: %w", err)
+	}
+	// 12-byte nonce per message (SM4-GCM standard).
+	nonce, err := ic.NewNonce(ic.SM4GCMNonceSize)
+	if err != nil {
+		return fmt.Errorf("protocol: gen nonce: %w", err)
+	}
+	// v0.1: no AAD. The MsgID is inside the encrypted envelope,
+	// so GCM still authenticates it as part of the plaintext.
+	// A future revision can pass env.MsgID as AAD after sending
+	// the MsgID in cleartext first.
+	ct, err := ic.SM4EncryptGCM(c.session.SessionKey, nonce, plain, nil)
+	if err != nil {
+		return fmt.Errorf("protocol: encrypt: %w", err)
+	}
+	// On-wire: nonce || ct (ct already includes the tag).
+	frame := make([]byte, 0, len(nonce)+len(ct))
+	frame = append(frame, nonce...)
+	frame = append(frame, ct...)
+	return c.conn.Send(frame)
+}
+
+// Recv blocks until one frame arrives, decrypts it, and returns
+// the inner Envelope. Honors ctx for cancellation.
+func (c *Channel) Recv(ctx context.Context) (Envelope, error) {
+	if err := ctx.Err(); err != nil {
+		return Envelope{}, err
+	}
+	fr, err := c.conn.Recv()
+	if err != nil {
+		return Envelope{}, fmt.Errorf("protocol: recv frame: %w", err)
+	}
+	if len(fr.Body) < ic.SM4GCMNonceSize+ic.SM4GCMTagSize {
+		return Envelope{}, errors.New("protocol: frame too short")
+	}
+	if len(fr.Body) > MaxEnvelopeSize {
+		return Envelope{}, errors.New("protocol: frame too large")
+	}
+	nonce := fr.Body[:ic.SM4GCMNonceSize]
+	ct := fr.Body[ic.SM4GCMNonceSize:]
+	// v0.1: no AAD (matches Send). GCM still authenticates the
+	// entire envelope (including MsgID) since they're inside
+	// the ciphertext. See package doc for future AAD plans.
+	plain, err := ic.SM4DecryptGCM(c.session.SessionKey, nonce, ct, nil)
+	if err != nil {
+		return Envelope{}, fmt.Errorf("protocol: decrypt: %w", err)
+	}
+	var env Envelope
+	if err := json.Unmarshal(plain, &env); err != nil {
+		return Envelope{}, fmt.Errorf("protocol: unmarshal envelope: %w", err)
+	}
+	// Verify the version is one we understand. We accept the
+	// current version only — future versions would need explicit
+	// compat code.
+	if env.Version != ProtocolVersion {
+		return Envelope{}, fmt.Errorf("protocol: unsupported version %d", env.Version)
+	}
+	return env, nil
+}
+
+// localPeerID is a hook for the CLI to inject the local PeerID
+// into envelopes. Returns nil if not set; the recipient's
+// verification doesn't depend on From anyway (handshake handles
+// identity).
+func (c *Channel) localPeerID() []byte {
+	return nil
+}
