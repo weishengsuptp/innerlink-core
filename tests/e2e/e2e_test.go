@@ -23,13 +23,18 @@ import (
 // the test binary is the driver, not what we want to
 // run — we want the innerlink binary to spawn.
 func TestMain(m *testing.M) {
-	if err := ensureBinary(); err != nil {
+	fmt.Fprintf(os.Stderr, "e2e: TestMain entry\n")
+	err := ensureBinary()
+	fmt.Fprintf(os.Stderr, "e2e: TestMain: ensureBinary returned err=%v\n", err)
+	if err != nil {
 		// We don't os.Exit here; the test will
 		// fail loudly when StartNode tries to
 		// find the binary. Printing to stderr
 		// makes the failure visible even if
 		// the test never runs.
 		os.Stderr.WriteString("e2e: ensureBinary failed: " + err.Error() + "\n")
+	} else {
+		fmt.Fprintf(os.Stderr, "e2e: ensureBinary OK\n")
 	}
 	os.Exit(m.Run())
 }
@@ -40,19 +45,38 @@ func TestMain(m *testing.M) {
 // ~5s to compile, and the user runs these tests often.
 // Missing-binary detection is a "first run" thing.
 func ensureBinary() error {
-	bin := binPath()
+	wd, _ := os.Getwd()
+	repoRoot := findProjectRoot(wd)
+	// Anchor every path resolution at the repo
+	// root, not at cwd. `go test` runs the test
+	// binary with cwd = the package directory
+	// (tests/e2e/), but the binary lives at
+	// <repoRoot>/tests/e2e/bin/. Using cwd
+	// produces paths like tests/e2e/tests/e2e/...
+	// when cwd is the package dir.
+	bin := filepath.Join(repoRoot, binPath())
 	if _, err := os.Stat(bin); err == nil {
+		fmt.Fprintf(os.Stderr, "e2e: ensureBinary: ALREADY EXISTS %s\n", bin)
 		return nil
 	}
 	if err := os.MkdirAll(filepath.Dir(bin), 0o755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", filepath.Dir(bin), err)
+	}
+	cmd := exec.Command("go", "build", "-o", bin, "./cmd/innerlink")
+	cmd.Dir = repoRoot
+	cmd.Stderr = os.Stderr
+	cmd.Stdout = os.Stdout
+	fmt.Fprintf(os.Stderr, "e2e: ensureBinary: cwd=%s repoRoot=%s target=%s\n", wd, repoRoot, bin)
+	if err := cmd.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "e2e: ensureBinary: go build failed: %v\n", err)
 		return err
 	}
-	// Use `go build` from the project root. Tests
-	// run with cwd = package directory, so the
-	// relative path ".." gets us to the repo root.
-	cmd := exec.Command("go", "build", "-o", bin, "../../cmd/innerlink")
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	if _, err := os.Stat(bin); err != nil {
+		fmt.Fprintf(os.Stderr, "e2e: ensureBinary: build returned 0 but binary still missing at %s\n", bin)
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "e2e: ensureBinary: built %s\n", bin)
+	return nil
 }
 
 // ---------------------------------------------------------------------------
