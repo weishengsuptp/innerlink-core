@@ -39,6 +39,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -50,6 +51,7 @@ import (
 	"github.com/weishengsuptp/innerlink-core/internal/logx"
 	"github.com/weishengsuptp/innerlink-core/internal/protocol"
 	"github.com/weishengsuptp/innerlink-core/internal/storage"
+	"github.com/weishengsuptp/innerlink-core/internal/alias"
 	"github.com/weishengsuptp/innerlink-core/internal/transport"
 )
 
@@ -194,6 +196,23 @@ func run() error {
 	historyPtr := &history
 	log.Printf("[INFO ] chat log: %d records loaded", len(history))
 
+	// M4: peer aliases. Same directory as the
+	// device key (~/.innerlink/aliases.json on
+	// a normal install). First launch creates
+	// the file on the first Save; Open on a
+	// missing file is fine.
+	aliasPath := alias.DefaultPath(keyPath)
+	aliasStore, err := alias.Open(aliasPath)
+	if err != nil {
+		return fmt.Errorf("open alias file: %w", err)
+	}
+	defer func() {
+		if err := aliasStore.Close(); err != nil {
+			log.Printf("[ERROR] close alias file: %v", err)
+		}
+	}()
+	log.Printf("[INFO ] alias file: %s", aliasPath)
+
 	// 4) + 5) Glue: discovery → dial → handshake → channel.
 	channels := newChannelRegistry()
 	defer channels.closeAll()
@@ -208,7 +227,7 @@ func run() error {
 				if !ok {
 					return
 				}
-				go handleInbound(ctx, id, inbound, channels, resolvedSaveDir, chatStore, historyPtr)
+				go handleInbound(ctx, id, inbound, channels, resolvedSaveDir, chatStore, historyPtr, aliasStore)
 			}
 		}
 	}()
@@ -219,7 +238,8 @@ func run() error {
 			switch ev.Type {
 			case discovery.PeerAdded:
 				log.Printf("[PEER ] joined   peer=%s at %s", peerHex(ev.PeerID), ev.Peer.Addr)
-				go dialAndHandshake(ctx, id, tr, ev.Peer, channels, resolvedSaveDir, chatStore, historyPtr)
+				aliasStore.Touch(peerHex(ev.PeerID))
+				go dialAndHandshake(ctx, id, tr, ev.Peer, channels, resolvedSaveDir, chatStore, historyPtr, aliasStore)
 			case discovery.PeerRemoved:
 				log.Printf("[PEER ] left     peer=%s", peerHex(ev.PeerID))
 			}
@@ -227,7 +247,7 @@ func run() error {
 	}()
 
 	// Stdin command loop.
-	go runStdinLoop(ctx, cancel, channels, chatStore, historyPtr, id, tr, resolvedSaveDir)
+	go runStdinLoop(ctx, cancel, channels, chatStore, historyPtr, id, tr, resolvedSaveDir, aliasStore)
 
 	// Wait for Ctrl+C.
 	<-ctx.Done()
@@ -315,7 +335,7 @@ func (r *channelRegistry) closeAll() {
 // check is done here rather than at the call site so that races
 // between two simultaneous dialAndHandshake goroutines for the
 // same peer also collapse to a single connection.
-func dialAndHandshake(ctx context.Context, id *identity.Identity, tr *transport.Transport, p *discovery.Peer, reg *channelRegistry, saveDir string, chatStore *storage.Store, history *[]*storage.Record) {
+func dialAndHandshake(ctx context.Context, id *identity.Identity, tr *transport.Transport, p *discovery.Peer, reg *channelRegistry, saveDir string, chatStore *storage.Store, history *[]*storage.Record, aliasStore *alias.Store) {
 	if p.Addr == nil {
 		return
 	}
@@ -346,12 +366,12 @@ func dialAndHandshake(ctx context.Context, id *identity.Identity, tr *transport.
 		return
 	}
 	log.Printf("[HANDS] ok       peer=%s (initiator)", peerHex(p.PeerID))
-	wrapChannel(ctx, conn, sess, reg, saveDir, chatStore, history, id)
+	wrapChannel(ctx, conn, sess, reg, saveDir, chatStore, history, id, aliasStore)
 }
 
 // handleInbound is the responder counterpart: another peer
 // dialed us, ran the handshake; we accept and wrap.
-func handleInbound(ctx context.Context, id *identity.Identity, conn *transport.Conn, reg *channelRegistry, saveDir string, chatStore *storage.Store, history *[]*storage.Record) {
+func handleInbound(ctx context.Context, id *identity.Identity, conn *transport.Conn, reg *channelRegistry, saveDir string, chatStore *storage.Store, history *[]*storage.Record, aliasStore *alias.Store) {
 	hctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	sess, err := handshake.RunAsResponder(hctx, id, conn)
@@ -360,7 +380,7 @@ func handleInbound(ctx context.Context, id *identity.Identity, conn *transport.C
 		return
 	}
 	log.Printf("[HANDS] ok       peer=%s (responder)", peerHex(sess.RemotePeerID))
-	wrapChannel(ctx, conn, sess, reg, saveDir, chatStore, history, id)
+	wrapChannel(ctx, conn, sess, reg, saveDir, chatStore, history, id, aliasStore)
 }
 
 // dialAddr is the manual-connect counterpart to
@@ -377,7 +397,7 @@ func handleInbound(ctx context.Context, id *identity.Identity, conn *transport.C
 // the connection. It's also a useful escape hatch
 // for cross-subnet peers, where the broadcast
 // yellow pages can't reach.
-func dialAddr(ctx context.Context, id *identity.Identity, tr *transport.Transport, addr string, reg *channelRegistry, saveDir string, chatStore *storage.Store, history *[]*storage.Record) {
+func dialAddr(ctx context.Context, id *identity.Identity, tr *transport.Transport, addr string, reg *channelRegistry, saveDir string, chatStore *storage.Store, history *[]*storage.Record, aliasStore *alias.Store) {
 	go func() {
 		dctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
@@ -399,7 +419,7 @@ func dialAddr(ctx context.Context, id *identity.Identity, tr *transport.Transpor
 			return
 		}
 		log.Printf("[HANDS] ok       peer=%s (initiator) addr=%s", peerHex(sess.RemotePeerID), addr)
-		wrapChannel(ctx, conn, sess, reg, saveDir, chatStore, history, id)
+		wrapChannel(ctx, conn, sess, reg, saveDir, chatStore, history, id, aliasStore)
 	}()
 }
 
@@ -411,7 +431,16 @@ func dialAddr(ctx context.Context, id *identity.Identity, tr *transport.Transpor
 //
 // saveDir is where completed incoming files land. If empty,
 // defaults to <home>/Downloads/innerlink.
-func wrapChannel(ctx context.Context, conn *transport.Conn, sess *handshake.Session, reg *channelRegistry, saveDir string, chatStore *storage.Store, history *[]*storage.Record, id *identity.Identity) {
+func wrapChannel(ctx context.Context, conn *transport.Conn, sess *handshake.Session, reg *channelRegistry, saveDir string, chatStore *storage.Store, history *[]*storage.Record, id *identity.Identity, aliasStore *alias.Store) {
+	// M4: bump last_seen on every channel open. The
+	// discovery layer also Touches on PeerAdded, so
+	// a peer that announces but never connects still
+	// shows up in the alias list with a recent
+	// timestamp. Here we catch the case where a
+	// peer connects (dial or accept) and we have a
+	// confirmed handshake.
+	aliasStore.Touch(peerHex(sess.RemotePeerID))
+
 	ch, err := protocol.NewChannel(conn, sess)
 	if err != nil {
 		log.Printf("[ERROR] new channel: %v", err)
@@ -456,7 +485,8 @@ func wrapChannel(ctx context.Context, conn *transport.Conn, sess *handshake.Sess
 			}
 			switch env.Type {
 			case protocol.TypeText:
-				log.Printf("[MSG  ] in  <%s> %s", peerHexStr, string(env.Payload))
+			log.Printf("[MSG  ] in  <%s> %s", peerHexStr, string(env.Payload))
+			aliasStore.Touch(peerHexStr)
 				// Persist incoming text to the local
 				// encrypted log. We record From = the
 				// peer's PeerID (not our own), To = our
@@ -476,6 +506,7 @@ func wrapChannel(ctx context.Context, conn *transport.Conn, sess *handshake.Sess
 				*history = append(*history, rec)
 			case protocol.TypePing:
 				log.Printf("[MSG  ] in  <%s> ping", peerHexStr)
+				aliasStore.Touch(peerHexStr)
 				_ = ch.SendPing(ctx) // pong
 			case protocol.TypePong:
 				// ignore for v0.1
@@ -500,7 +531,7 @@ func wrapChannel(ctx context.Context, conn *transport.Conn, sess *handshake.Sess
 //   - ping <peer-id-hex>           send a ping
 //   - help                         list commands
 //   - quit                         exit
-func runStdinLoop(ctx context.Context, cancel context.CancelFunc, reg *channelRegistry, chatStore *storage.Store, history *[]*storage.Record, id *identity.Identity, tr *transport.Transport, saveDir string) {
+func runStdinLoop(ctx context.Context, cancel context.CancelFunc, reg *channelRegistry, chatStore *storage.Store, history *[]*storage.Record, id *identity.Identity, tr *transport.Transport, saveDir string, aliasStore *alias.Store) {
 	scanner := bufio.NewScanner(os.Stdin)
 	printPrompt()
 	for scanner.Scan() {
@@ -514,26 +545,75 @@ func runStdinLoop(ctx context.Context, cancel context.CancelFunc, reg *channelRe
 		switch cmd {
 		case "send":
 			if len(parts) < 3 {
-				log.Println("[USAGE] send <peer-id-hex> <text>")
+				log.Println("[USAGE] send <peer-id-or-alias> <text>")
 			} else {
-				sendTo(reg, parts[1], parts[2], chatStore, history, id)
+				sendTo(reg, parts[1], parts[2], chatStore, history, id, aliasStore)
 			}
 		case "sendfile":
 			if len(parts) < 3 {
-				log.Println("[USAGE] sendfile <peer-id-hex> <local-path>")
+				log.Println("[USAGE] sendfile <peer-id-or-alias> <local-path>")
 			} else {
-				sendFile(reg, parts[1], parts[2])
+				sendFile(reg, parts[1], parts[2], aliasStore)
 			}
 		case "history":
-			showHistory(*history, parts[1:], id)
+			showHistory(*history, parts[1:], id, aliasStore)
 		case "ping":
 			if len(parts) < 2 {
-				log.Println("[USAGE] ping <peer-id-hex>")
+				log.Println("[USAGE] ping <peer-id-or-alias>")
 			} else {
-				pingPeer(reg, parts[1])
+				pingPeer(reg, parts[1], aliasStore)
+			}
+		case "alias":
+			// alias <name> <peer-id-hex>  — assign
+			// a friendly name to a peer. Names
+			// are case-sensitive and must be
+			// 1-64 chars (the alias package
+			// validates). A peer can have at
+			// most one alias; assigning a
+			// second one overwrites the first.
+			if len(parts) < 3 {
+				log.Println("[USAGE] alias <name> <peer-id-hex>")
+				log.Println("        alias    -- list all aliases")
+			} else if parts[1] == "list" {
+				listAliases(aliasStore)
+			} else {
+				if err := aliasStore.Set(parts[2], parts[1]); err != nil {
+					log.Printf("[ERROR] alias: %v", err)
+				} else {
+					if err := aliasStore.Save(); err != nil {
+						log.Printf("[ERROR] alias save: %v", err)
+					} else {
+						log.Printf("[INFO ] aliased %s -> %s", parts[1], parts[2])
+					}
+				}
+			}
+		case "unalias":
+			// unalias <name-or-peer-id>  — drop
+			// the alias for the given reference.
+			// We resolve first because names
+			// are easier to type than 32-char
+			// hex, and the user usually
+			// remembers the name.
+			if len(parts) < 2 {
+				log.Println("[USAGE] unalias <name-or-peer-id>")
+			} else {
+				pid, err := resolvePeerRef(aliasStore, parts[1])
+				if err != nil {
+					// Treat as raw peer id.
+					pid = parts[1]
+				}
+				if err := aliasStore.Remove(pid); err != nil {
+					log.Printf("[ERROR] unalias: %v", err)
+				} else {
+					if err := aliasStore.Save(); err != nil {
+						log.Printf("[ERROR] alias save: %v", err)
+					} else {
+						log.Printf("[INFO ] unaliased %s", pid)
+					}
+				}
 			}
 		case "peers":
-			log.Printf("[INFO ] no peer listing in v0.1; check the [PEER] log lines above")
+			showPeers(aliasStore)
 		case "dial":
 			// dial <ip:port>  -- bypass UDP discovery and
 			// connect directly to a known peer. Useful in
@@ -549,17 +629,20 @@ func runStdinLoop(ctx context.Context, cancel context.CancelFunc, reg *channelRe
 			if len(parts) < 2 {
 				log.Println("[USAGE] dial <ip:port>")
 			} else {
-				dialAddr(ctx, id, tr, parts[1], reg, saveDir, chatStore, history)
+				dialAddr(ctx, id, tr, parts[1], reg, saveDir, chatStore, history, aliasStore)
 			}
 		case "help":
-			log.Println("[HELP ] send <peer-id-hex> <text>   -- send a chat message")
-			log.Println("[HELP ] sendfile <peer-id-hex> <path> -- send a file")
-			log.Println("[HELP ] history [peer-id-hex]         -- show recent chat (optionally with one peer)")
-			log.Println("[HELP ] ping <peer-id-hex>           -- send a liveness probe")
-			log.Println("[HELP ] dial <ip:port>               -- connect directly (skip discovery)")
-			log.Println("[HELP ] peers                         -- (see [PEER] log lines)")
-			log.Println("[HELP ] help                          -- this list")
-			log.Println("[HELP ] quit                          -- exit")
+			log.Println("[HELP ] send <peer-id-or-alias> <text> -- send a chat message")
+			log.Println("[HELP ] sendfile <peer-id-or-alias> <path> -- send a file")
+			log.Println("[HELP ] history [peer-id-or-alias]     -- show recent chat (filter by one peer)")
+			log.Println("[HELP ] ping <peer-id-or-alias>         -- send a liveness probe")
+			log.Println("[HELP ] alias <name> <peer-id-hex>      -- name a peer")
+			log.Println("[HELP ] alias list                       -- show all aliases")
+			log.Println("[HELP ] unalias <name-or-peer-id>       -- drop an alias")
+			log.Println("[HELP ] peers                            -- list known peers + aliases")
+			log.Println("[HELP ] dial <ip:port>                   -- connect directly (skip discovery)")
+			log.Println("[HELP ] help                             -- this list")
+			log.Println("[HELP ] quit                             -- exit")
 		case "quit", "exit":
 			log.Println("[INFO ] bye")
 			cancel()
@@ -578,7 +661,16 @@ func printPrompt() {
 	fmt.Fprint(os.Stderr, "> ")
 }
 
-func sendTo(reg *channelRegistry, peerHex, text string, chatStore *storage.Store, history *[]*storage.Record, id *identity.Identity) {
+func sendTo(reg *channelRegistry, peerRef, text string, chatStore *storage.Store, history *[]*storage.Record, id *identity.Identity, aliasStore *alias.Store) {
+	// Accept either a 32-char hex peer id or a
+	// user-typed alias. The cmd's REPL doesn't care
+	// which one the user wrote; resolution is the
+	// alias store's job.
+	peerHex, err := resolvePeerRef(aliasStore, peerRef)
+	if err != nil {
+		log.Printf("[ERROR] %v", err)
+		return
+	}
 	pid, err := hexToBytes(peerHex)
 	if err != nil {
 		log.Printf("[ERROR] bad peer id hex: %v", err)
@@ -619,7 +711,12 @@ func sendTo(reg *channelRegistry, peerHex, text string, chatStore *storage.Store
 // sendFile streams a local file to the named peer. Blocking;
 // the REPL doesn't accept new stdin until the transfer
 // completes (or fails). Progress is logged every ~100ms.
-func sendFile(reg *channelRegistry, peerHex, path string) {
+func sendFile(reg *channelRegistry, peerRef, path string, aliasStore *alias.Store) {
+	peerHex, err := resolvePeerRef(aliasStore, peerRef)
+	if err != nil {
+		log.Printf("[ERROR] %v", err)
+		return
+	}
 	pid, err := hexToBytes(peerHex)
 	if err != nil {
 		log.Printf("[ERROR] bad peer id hex: %v", err)
@@ -662,7 +759,12 @@ func sendFile(reg *channelRegistry, peerHex, path string) {
 	}()
 }
 
-func pingPeer(reg *channelRegistry, peerHex string) {
+func pingPeer(reg *channelRegistry, peerRef string, aliasStore *alias.Store) {
+	peerHex, err := resolvePeerRef(aliasStore, peerRef)
+	if err != nil {
+		log.Printf("[ERROR] %v", err)
+		return
+	}
 	pid, err := hexToBytes(peerHex)
 	if err != nil {
 		log.Printf("[ERROR] bad peer id hex: %v", err)
@@ -686,18 +788,105 @@ func peerHex(pid []byte) string {
 	}
 	return fmt.Sprintf("%x", pid)
 }
-func showHistory(history []*storage.Record, args []string, id *identity.Identity) {
+
+// resolvePeerRef maps a user-typed peer reference
+// (either a 32-char hex peer id or a registered
+// alias name) to a canonical 32-char hex peer id.
+//
+// The alias package does the heavy lifting; this
+// wrapper just (1) returns friendly errors so the
+// REPL can print them, and (2) treats a valid
+// 32-char hex string as a no-op so power users
+// don't have to register a name just to send a
+// one-off message.
+func resolvePeerRef(aliasStore *alias.Store, ref string) (string, error) {
+	if aliasStore == nil {
+		// Defensive: the cmd wires a non-nil
+		// store at startup. If a future
+		// refactor forgets, fall through
+		// to the raw peer-id path.
+		return ref, nil
+	}
+	if id, ok := aliasStore.ResolvePeerRef(ref); ok {
+		return id, nil
+	}
+	return "", fmt.Errorf("unknown peer %q (use `peers` to list, `alias` to name)", ref)
+}
+
+// listAliases prints the alias table in a stable,
+// human-friendly order. Used by `alias list` and
+// also called internally by showPeers to keep the
+// formatting consistent across REPL commands.
+func listAliases(aliasStore *alias.Store) {
+	rows := aliasStore.ListWithNames()
+	if len(rows) == 0 {
+		log.Printf("[INFO ] no aliases yet (use `alias <name> <peer-id-hex>` to add one)")
+		return
+	}
+	for _, r := range rows {
+		if r.Name == "" {
+			// Placeholder row (Touch without
+			// Set). Show it so the user
+			// knows the peer exists; suggest
+			// the alias command.
+			log.Printf("[ALIAS] %s  (unnamed; alias it with: alias <name> %s)",
+				r.PeerID, r.PeerID)
+		} else {
+			log.Printf("[ALIAS] %-32s  %s", r.PeerID, r.Name)
+		}
+	}
+}
+
+// showPeers prints the current alias table with a
+// "last seen" timestamp per peer, sorted by recency
+// desc so the most recent activity is at the top.
+//
+// Why a separate command from `alias list`:
+// `peers` answers "who's out there right now?"
+// while `alias list` answers "what names have I
+// assigned?". They share the same backing table
+// but the user's intent is different. We present
+// `peers` in a "name + last_seen" two-column
+// format because recency is the deciding factor
+// for "is this thing still online?".
+func showPeers(aliasStore *alias.Store) {
+	rows := aliasStore.ListWithNames()
+	if len(rows) == 0 {
+		log.Printf("[INFO ] no peers seen yet")
+		return
+	}
+	// Sort by last_seen desc.
+	sort.Slice(rows, func(i, j int) bool {
+		return rows[i].LastSeen.After(rows[j].LastSeen)
+	})
+	log.Printf("[PEERS] %d known peer(s):", len(rows))
+	for _, r := range rows {
+		name := r.Name
+		if name == "" {
+			name = "(unnamed)"
+		}
+		// "5m ago" style is friendlier than
+		// "2026-06-17T19:55:00Z" but we don't
+		// want to pull in a fuzzy-time lib
+		// just for this. Local time HH:MM:SS
+		// is precise enough and matches the
+		// user's wall clock.
+		ago := r.LastSeen.Local().Format("2006-01-02 15:04:05")
+		log.Printf("[PEERS] %-20s  last seen %s  (%s)", name, ago, r.PeerID)
+	}
+}
+func showHistory(history []*storage.Record, args []string, id *identity.Identity, aliasStore *alias.Store) {
     // args is the slice after the "history" command
     // word. Empty = show all peers; one element =
-    // filter to that peer-id-hex.
+    // filter to that peer (id or alias).
     var filterPeer string
     if len(args) >= 1 {
-        pid, err := hexToBytes(args[0])
+        var err error
+        filterPeer, err = resolvePeerRef(aliasStore, args[0])
         if err != nil {
-            log.Printf("[ERROR] bad peer id hex: %v", err)
+            log.Printf("[ERROR] %v", err)
             return
         }
-        filterPeer = identityHex(pid)
     }
     if len(history) == 0 {
         log.Printf("[INFO ] no chat history yet")

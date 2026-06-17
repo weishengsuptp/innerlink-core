@@ -337,6 +337,79 @@ func StartNodeWithOptions(t *testing.T, alloc *PortAllocator, opts NodeOptions) 
 	return n
 }
 
+// ---------------------------------------------------------------------------
+// E2E M4: alias + peers list
+// ---------------------------------------------------------------------------
+
+// TestE2E_M4_AliasRoundTrip is the M4 alias regression.
+// A registers a name for B, then sends a chat
+// message to B using the alias. We assert the
+// sender-side log shows "aliased" and the receiver
+// sees the chat.
+func TestE2E_M4_AliasRoundTrip(t *testing.T) {
+	alloc := NewPortAllocator()
+	a := StartNode(t, alloc, "A")
+	b := StartNode(t, alloc, "B")
+	dialPair(t, a, b)
+
+	// Register a name. A's REPL will log
+	// "[INFO ] aliased 老王 -> <b.PeerID()>".
+	a.Send("alias 老王 " + b.PeerID())
+	a.WaitForLog(regexp.MustCompile(`\[INFO \] aliased`), 5*time.Second)
+
+	// Now send using the alias. The cmd should
+	// resolve "老王" to B's peer id and SendText
+	// over the existing channel.
+	a.Send("send 老王 你好from别名")
+	b.WaitForLog(regexp.MustCompile(`\[MSG  \] in  <[0-9a-f]{32}> 你好from别名`), 5*time.Second)
+
+	// The aliases file should now exist on disk
+	// under A's save dir.
+	aliasesPath := filepath.Join(a.Dir(), "aliases.json")
+	if _, err := os.Stat(aliasesPath); err != nil {
+		t.Fatalf("e2e: M4: %s should exist after `alias` cmd: %v", aliasesPath, err)
+	}
+
+	// unalias, then send to the now-unknown name
+	// and expect an "unknown peer" error from the
+	// cmd, not a successful send.
+	a.Send("unalias 老王")
+	a.WaitForLog(regexp.MustCompile(`\[INFO \] unaliased`), 5*time.Second)
+	a.Send("send 老王 bye")
+	a.WaitForLog(regexp.MustCompile(`unknown peer "老王"`), 5*time.Second)
+}
+
+// TestE2E_M4_PeersList is the M4 peers-list
+// regression. After two nodes have shaken hands,
+// A's `peers` command should show B (named or
+// unnamed) in the listing. We don't pin the exact
+// name (the user might have aliased it via a
+// previous test in the same package's temp dir;
+// each test gets a fresh dir), but we assert the
+// peer id appears in the listing.
+func TestE2E_M4_PeersList(t *testing.T) {
+	alloc := NewPortAllocator()
+	a := StartNode(t, alloc, "A")
+	b := StartNode(t, alloc, "B")
+	dialPair(t, a, b)
+
+	// A's discovery layer Touches B on PeerAdded;
+	// wrapChannel Touches it again on handshake
+	// success. After dialPair returns, B should
+	// already be in the alias table.
+	a.Send("peers")
+	a.WaitForLog(regexp.MustCompile(`\[PEERS\] \d+ known peer\(s\)`), 5*time.Second)
+
+	// B's peer id must appear in the listing. The
+	// formatter prints "<name>  last seen ...  (<peer>)"
+	// for named rows and the placeholder form
+	// "(unnamed)  last seen ...  (<peer>)" for
+	// unknown ones. Either way, the peer id
+	// substring is in the log.
+	bID := b.PeerID()
+	a.WaitForLog(regexp.MustCompile(bID), 5*time.Second)
+}
+
 // startNodeWithArgs is the low-level constructor. It
 // does NOT wait for readiness; both StartNode and
 // StartNodeWithOptions call it and then wait.
