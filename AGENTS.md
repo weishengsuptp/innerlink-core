@@ -220,3 +220,49 @@ add a test case to `TestClassify` so the mapping is
 pinned. If the line is high-frequency, give it a body
 prefix that `classify` can detect (e.g. `[FILE] recv
 chunk ...` → debug).
+
+## SM4-CBC IV is exactly 16 bytes — gmsm hard-asserts (踩过的坑)
+
+`github.com/tjfoc/gmsm/sm4.SM4EncryptCBC` returns
+`"crypto: SM4-CBC iv must be 16 bytes"` for any other
+length. SM4-GCM uses 12-byte nonces, so it is tempting
+to "harmonize" and use 12-byte IVs everywhere — but
+CBC is strictly 16 bytes per SP 800-38A. Don't do it.
+
+If you ever need a per-record IV smaller than 16 bytes
+in storage, the right move is a different cipher (CTR
+or GCM), not changing the CBC IV size.
+
+## local chat log derives its key from the SM2 device key (踩过的坑)
+
+`internal/storage` stores `chat.enc` encrypted with
+SM4-CBC under a key derived from
+`identity.Identity.PrivateKeyD()` via the existing
+`crypto.KDF(secret, info, 16)` with
+`info = "innerlink-storage-v1"`. This means:
+
+  1. The SM4 key is never written to disk. Losing
+     `device.key` is the only way to lose chat
+     history, and that's a feature, not a bug — we
+     never have plaintext-derived material lying
+     around.
+  2. The KDF `info` string is a domain-separation
+     tag. Bumping it (e.g. to
+     `"innerlink-storage-v2"`) is an intentional
+     "burn the old chat.enc" decision, not an
+     accident. Don't change it without coordinating
+     a release.
+  3. Tests in `internal/storage/storage_test.go` use
+     a 32-byte random `fakeDeviceKey` — that is
+     exactly what `Identity.PrivateKeyD()` returns,
+     so the storage layer is symmetric in its
+     handling of real device keys and the test
+     fakes. The only thing that changes is how the
+     key is sourced.
+
+If you ever add a "change passphrase" / "re-key"
+feature, the way to do it is: read all records with
+the old key, derive a new key (e.g. KDF of new
+passphrase + old D), encrypt+rewrite the entire
+file. There is no in-place re-key for CBC.
+
