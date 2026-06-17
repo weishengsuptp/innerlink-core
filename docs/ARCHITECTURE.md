@@ -57,6 +57,12 @@
          │  chat.enc 加密写   │    （KDF(SM2_D) → SM4-CBC 16 B IV）
          │  + history 加载   │
          └──────────────────┘
+
+         ┌──────────────────┐
+         │  internal/alias    │  ← M4 旁路：peer-id → 人类可读名字
+         │  aliases.json      │    （atomic write; touch on activity）
+         │  + ResolvePeerRef  │
+         └──────────────────┘
                       │
                       ▼
          ┌──────────────────┐
@@ -217,7 +223,57 @@ JSON 明文：
 
 > `msgID` 字段在 v0.1 留空 — 它是 v0.3 协议引入 AAD 时会填的。文件层已经准备好接，未来不破坏格式。
 
-## 4. 性能预算（v0.3 实测）
+### 3.5 alias（M4 别名 + peer 列表）
+
+```go
+// 打开 ~/.innerlink/aliases.json（与 device.key 同目录）
+store, _ := alias.Open(alias.DefaultPath(keyPath))
+defer store.Close()
+
+// 手动命名
+store.Set(peerID, "老王工位机")
+store.Save()  // atomic write: <path>.tmp + rename
+
+// 解析 send 第一个参数（hex 或 alias）
+peerID, ok := store.ResolvePeerRef("老王工位机")
+```
+
+**存储格式**（`~/.innerlink/aliases.json`）：
+
+```json
+{
+  "v": 1,
+  "aliases": {
+    "<peer-id-hex>": {
+      "name": "老王工位机",
+      "first_seen": "2026-06-17T...",
+      "last_seen":  "2026-06-17T..."
+    }
+  }
+}
+```
+
+**两类写入**：
+
+- `Set(peerID, name)` —— 来自 REPL `alias` 命令，**用户手动**
+- `Touch(peerID)` —— 来自 cmd runtime：discovery `PeerAdded` + wrapChannel 入口**自动**。**未命名**的 peer 也会有 placeholder row（`name=""`），让 `peers` 命令能列出最近活跃但还没起名的设备
+
+**一致性保证**：
+
+- JSON 文件用 `<path>.tmp` + `os.Rename` 原子写，**crash 中断**不会留半截文件
+- 解析失败 → 硬错（`ErrCorrupt`），**不**静默当成空表
+- 写入并发由 `sync.Mutex` 序列化
+- 输入校验：peer-id 必须是 32 字符小写 hex；name 1-64 字符
+
+**REPL 集成**：
+
+- `send`/`sendfile`/`ping`/`history` 第一个参数**同时**接受 32 字符 hex **或** alias name
+- `alias <name> <peer-id-hex>` / `alias list` / `unalias <name-or-peer-id>` —— 增删查
+- `peers` —— 列已知 peer，按 `last_seen` 倒序，named 显示 name，unnamed 显示 "(unnamed)"
+
+**为什么 v0.4 不做协议 v2**：AAD、MsgID、重放窗口属于 v0.5 (M5)。M4 只解决"用户能识别对端"的人机交互层。
+
+## 4. 性能预算（v0.4 实测）
 
 | 指标 | 实测值 |
 |---|---|
@@ -227,7 +283,10 @@ JSON 明文：
 | `innerlink.exe` 大小 | 5.1 MB（upx 之前） |
 | M3 chat.enc 写延迟（每条） | < 5ms（KDF 一次启动，crypto 在内存） |
 | M3 chat.enc 启动加载 1000 条 | < 50ms（SM4 解密 + JSON 反序列化） |
-| CI 全量测试 | ~5 min（CI 上 race detector 可跑） |
+| M4 alias 写（set + save） | < 1ms（10 个 alias 时） |
+| M4 alias 启动加载 100 条 | < 5ms（JSON unmarshal） |
+| M4 alias ResolvePeerRef | < 1μs（in-memory map 查找） |
+| CI 全量测试 + race | ~1 min |
 
 ## 5. 失败模式
 
@@ -257,7 +316,8 @@ D:\innerlink
 │   ├── protocol/              Envelope + Channel
 │   ├── filetransfer/          分片 + SHA-256 校验
 │   ├── logx/                  日志级别 + 文件 sink
-│   └── storage/               M3 ✅ 加密落盘 + history
+│   ├── storage/               M3 ✅ 加密落盘 + history
+│   └── alias/                 M4 ✅ peer 别名 + 解析
 ├── docs/
 │   ├── PRD.md                 产品需求
 │   └── ARCHITECTURE.md        ← 你正在看

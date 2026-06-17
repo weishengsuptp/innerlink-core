@@ -1,7 +1,7 @@
 # innerlink-core 产品需求（PRD）
 
-> 版本：v0.3（2026-06-17）
-> 状态：M1 / M2 / M3 已完成，M4 规划中
+> 版本：v0.4（2026-06-17）
+> 状态：M1 / M2 / M3 / M4 已完成，M5 规划中
 > 阅读对象：项目协作者、AI 智能体（Mavis）、测试者
 
 ---
@@ -77,11 +77,29 @@
 - mlock'd key material
 - per-peer 独立文件
 
-### M4 — 关系与单元测试（规划中）
+### M4 — 关系与别名 ✅（v0.4，2026-06-17）
 
-- PeerID 别名（"给这台 peer 起个名字"）
-- 协议 v2 草案（AAD、重放窗口）
-- 全链路 property-based tests
+`internal/alias` 完成：peer-id → 人类可读名字的映射，存 `~/.innerlink/aliases.json`（与 device.key 同目录）。cmd REPL 新增：
+
+- `alias <name> <peer-id-hex>` — 给 peer 起名字
+- `alias list` — 列所有别名
+- `unalias <name-or-peer-id>` — 删别名
+- `peers` — 列当前所有已知 peer（含未命名），按最后活跃时间倒序
+
+`send` / `sendfile` / `ping` / `history` 第一个参数**同时支持 32 字符 hex 跟别名**。未知的引用会清晰报错（不会静默发送失败）。
+
+**v0.1 明确不做的**（留 M5 之前）：
+
+- 协议 v2（AAD / 重放窗口）
+- group alias
+- 通知 / 声音
+- 别名 import/export
+
+### M5 — 协议 v2 + API 冻结（规划中）
+
+- 协议 v2：MsgID 做 AAD，每个 Channel 一个 ring buffer 防重放
+- 第三方密码学审计
+- 邀请第三方做密码学审计
 
 ### M5 — API 稳定 + 外部审计（规划中）
 
