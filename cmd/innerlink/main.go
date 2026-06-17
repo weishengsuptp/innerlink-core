@@ -33,10 +33,12 @@ package main
 import (
 	"bufio"
 	"context"
+	"flag"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -45,6 +47,7 @@ import (
 	"github.com/weishengsuptp/innerlink-core/internal/filetransfer"
 	"github.com/weishengsuptp/innerlink-core/internal/handshake"
 	"github.com/weishengsuptp/innerlink-core/internal/identity"
+	"github.com/weishengsuptp/innerlink-core/internal/logx"
 	"github.com/weishengsuptp/innerlink-core/internal/protocol"
 	"github.com/weishengsuptp/innerlink-core/internal/transport"
 )
@@ -55,7 +58,47 @@ func main() {
 	}
 }
 
+// defaultLogFile returns the default path of the innerlink
+// log file. It is "innerlink.log" next to the executable so
+// the user can find it on the desktop, and falls back to
+// the current working directory when the executable path
+// cannot be resolved (which happens for `go run`-built
+// binaries where os.Executable returns a temp path).
+func defaultLogFile() string {
+	if exe, err := os.Executable(); err == nil {
+		return filepath.Join(filepath.Dir(exe), "innerlink.log")
+	}
+	return "innerlink.log"
+}
+
 func run() error {
+	// CLI flags. The defaults are tuned for normal use:
+	// -log-level=info keeps the screen readable, and
+	// -log-file=innerlink.log next to the binary gives
+	// you a file you can attach to a bug report without
+	// scrolling. For development / debugging sendfile
+	// hangs, use -log-level=debug to also see the
+	// per-chunk progress and writeAt timings.
+	logLevel := flag.String("log-level", string(logx.LevelInfo),
+		"log verbosity: debug | info | warn | error. "+
+			"debug includes per-chunk [FILE recv chunk ...] and "+
+			"per-100ms [FILE sending ... %] lines, which are "+
+			"noisy during multi-GiB transfers.")
+	logFile := flag.String("log-file", defaultLogFile(),
+		"path of the log file (in addition to stderr). "+
+			"Use \"\" to disable file output. The file is "+
+			"appended, so successive runs share the same log.")
+	flag.Parse()
+
+	if err := logx.Setup(logx.Options{
+		Level:  logx.Level(*logLevel),
+		File:   *logFile,
+		Stderr: true,
+	}); err != nil {
+		return fmt.Errorf("logx setup: %w", err)
+	}
+	defer logx.Close()
+
 	// 1) Device identity.
 	keyPath, err := identity.ResolveDeviceKeyPath()
 	if err != nil {
