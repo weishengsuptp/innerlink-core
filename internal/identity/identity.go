@@ -88,6 +88,29 @@ func (id *Identity) PublicKey() []byte {
 	return id.pubKey
 }
 
+// PrivateKeyD returns the 32-byte SM2 private scalar D (big-endian),
+// i.e. the actual secret of the device. This is the raw form that
+// gets written to ~/.innerlink/device.key on Save.
+//
+// Why expose it: the local-storage layer (internal/storage) needs
+// D to derive a stable SM4 key for encrypting chat history. We
+// could implement that derivation as a method on Identity, but D
+// is the right primitive — anyone with a copy of D plus the
+// derivation tag can independently compute the storage key.
+//
+// The returned slice is freshly allocated and safe to hold.
+//
+// SECURITY: callers MUST treat the returned bytes like a password.
+// Do not log it, do not write it to disk outside the key file, do
+// not pass it to any function that produces a hash without a
+// domain-separation tag.
+func (id *Identity) PrivateKeyD() []byte {
+	if id == nil || id.priv == nil {
+		return nil
+	}
+	return marshalPrivate(id.priv)
+}
+
 // PeerID returns the 16-byte short identifier derived from the public key.
 // Two identities with the same public key will always have the same PeerID;
 // two identities with different public keys will (with overwhelming

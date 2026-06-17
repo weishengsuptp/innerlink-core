@@ -49,6 +49,7 @@ import (
 	"github.com/weishengsuptp/innerlink-core/internal/identity"
 	"github.com/weishengsuptp/innerlink-core/internal/logx"
 	"github.com/weishengsuptp/innerlink-core/internal/protocol"
+	"github.com/weishengsuptp/innerlink-core/internal/storage"
 	"github.com/weishengsuptp/innerlink-core/internal/transport"
 )
 
@@ -139,13 +140,38 @@ func run() error {
 		}
 	}()
 
-	// Default save dir for incoming files. Created on first
-	// use by the Receiver.
+	// Default save dir for incoming files AND for the
+	// encrypted chat log (chat.enc). Created on first
+	// use by the Receiver and the Storage layer.
 	saveDir, err := defaultSaveDir()
 	if err != nil {
 		return fmt.Errorf("resolve save dir: %w", err)
 	}
 	log.Printf("[INFO ] incoming files save dir: %s", saveDir)
+
+	// M3: encrypted chat log. The Store derives its SM4
+	// key from id.PrivateKeyD(), so the same device.key
+	// is what decrypts chat.enc on next launch. If the
+	// file is missing (first launch) or unreadable
+	// (wrong key) we treat both as "no history yet" —
+	// the chat log is best-effort, never blocking the
+	// user from chatting.
+	chatStore, err := storage.Open(saveDir, id.PrivateKeyD())
+	if err != nil {
+		return fmt.Errorf("open chat log: %w", err)
+	}
+	defer func() {
+		if err := chatStore.Close(); err != nil {
+			log.Printf("[ERROR] close chat log: %v", err)
+		}
+	}()
+	history, err := chatStore.ReadAll()
+	if err != nil {
+		log.Printf("[ERROR] read chat log: %v (starting with empty history)", err)
+		history = nil
+	}
+	historyPtr := &history
+	log.Printf("[INFO ] chat log: %d records loaded", len(history))
 
 	// 4) + 5) Glue: discovery → dial → handshake → channel.
 	channels := newChannelRegistry()
@@ -161,7 +187,7 @@ func run() error {
 				if !ok {
 					return
 				}
-				go handleInbound(ctx, id, inbound, channels, saveDir)
+				go handleInbound(ctx, id, inbound, channels, saveDir, chatStore, historyPtr)
 			}
 		}
 	}()
@@ -172,7 +198,7 @@ func run() error {
 			switch ev.Type {
 			case discovery.PeerAdded:
 				log.Printf("[PEER ] joined   peer=%s at %s", peerHex(ev.PeerID), ev.Peer.Addr)
-				go dialAndHandshake(ctx, id, tr, ev.Peer, channels, saveDir)
+				go dialAndHandshake(ctx, id, tr, ev.Peer, channels, saveDir, chatStore, historyPtr)
 			case discovery.PeerRemoved:
 				log.Printf("[PEER ] left     peer=%s", peerHex(ev.PeerID))
 			}
@@ -180,7 +206,7 @@ func run() error {
 	}()
 
 	// Stdin command loop.
-	go runStdinLoop(ctx, cancel, channels)
+	go runStdinLoop(ctx, cancel, channels, chatStore, historyPtr, id)
 
 	// Wait for Ctrl+C.
 	<-ctx.Done()
@@ -268,7 +294,7 @@ func (r *channelRegistry) closeAll() {
 // check is done here rather than at the call site so that races
 // between two simultaneous dialAndHandshake goroutines for the
 // same peer also collapse to a single connection.
-func dialAndHandshake(ctx context.Context, id *identity.Identity, tr *transport.Transport, p *discovery.Peer, reg *channelRegistry, saveDir string) {
+func dialAndHandshake(ctx context.Context, id *identity.Identity, tr *transport.Transport, p *discovery.Peer, reg *channelRegistry, saveDir string, chatStore *storage.Store, history *[]*storage.Record) {
 	if p.Addr == nil {
 		return
 	}
@@ -299,12 +325,12 @@ func dialAndHandshake(ctx context.Context, id *identity.Identity, tr *transport.
 		return
 	}
 	log.Printf("[HANDS] ok       peer=%s (initiator)", peerHex(p.PeerID))
-	wrapChannel(ctx, conn, sess, reg, saveDir)
+	wrapChannel(ctx, conn, sess, reg, saveDir, chatStore, history, id)
 }
 
 // handleInbound is the responder counterpart: another peer
 // dialed us, ran the handshake; we accept and wrap.
-func handleInbound(ctx context.Context, id *identity.Identity, conn *transport.Conn, reg *channelRegistry, saveDir string) {
+func handleInbound(ctx context.Context, id *identity.Identity, conn *transport.Conn, reg *channelRegistry, saveDir string, chatStore *storage.Store, history *[]*storage.Record) {
 	hctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	sess, err := handshake.RunAsResponder(hctx, id, conn)
@@ -313,7 +339,7 @@ func handleInbound(ctx context.Context, id *identity.Identity, conn *transport.C
 		return
 	}
 	log.Printf("[HANDS] ok       peer=%s (responder)", peerHex(sess.RemotePeerID))
-	wrapChannel(ctx, conn, sess, reg, saveDir)
+	wrapChannel(ctx, conn, sess, reg, saveDir, chatStore, history, id)
 }
 
 // wrapChannel takes a freshly-handed-shaked Conn+Session and
@@ -324,7 +350,7 @@ func handleInbound(ctx context.Context, id *identity.Identity, conn *transport.C
 //
 // saveDir is where completed incoming files land. If empty,
 // defaults to <home>/Downloads/innerlink.
-func wrapChannel(ctx context.Context, conn *transport.Conn, sess *handshake.Session, reg *channelRegistry, saveDir string) {
+func wrapChannel(ctx context.Context, conn *transport.Conn, sess *handshake.Session, reg *channelRegistry, saveDir string, chatStore *storage.Store, history *[]*storage.Record, id *identity.Identity) {
 	ch, err := protocol.NewChannel(conn, sess)
 	if err != nil {
 		log.Printf("[ERROR] new channel: %v", err)
@@ -370,6 +396,23 @@ func wrapChannel(ctx context.Context, conn *transport.Conn, sess *handshake.Sess
 			switch env.Type {
 			case protocol.TypeText:
 				log.Printf("[MSG  ] in  <%s> %s", peerHexStr, string(env.Payload))
+				// Persist incoming text to the local
+				// encrypted log. We record From = the
+				// peer's PeerID (not our own), To = our
+				// own, so the history reads naturally
+				// when filtered by peer.
+				rec := &storage.Record{
+					Timestamp: time.Now().UTC(),
+					From:      peerHexStr,
+					To:        id.PeerIDHex(),
+					Direction: "in",
+					Body:      string(env.Payload),
+					MsgID:     "", // M3 v0.1: not exposed
+				}
+				if err := chatStore.Append(rec); err != nil {
+					log.Printf("[ERROR] chat log append: %v", err)
+				}
+				*history = append(*history, rec)
 			case protocol.TypePing:
 				log.Printf("[MSG  ] in  <%s> ping", peerHexStr)
 				_ = ch.SendPing(ctx) // pong
@@ -396,7 +439,7 @@ func wrapChannel(ctx context.Context, conn *transport.Conn, sess *handshake.Sess
 //   - ping <peer-id-hex>           send a ping
 //   - help                         list commands
 //   - quit                         exit
-func runStdinLoop(ctx context.Context, cancel context.CancelFunc, reg *channelRegistry) {
+func runStdinLoop(ctx context.Context, cancel context.CancelFunc, reg *channelRegistry, chatStore *storage.Store, history *[]*storage.Record, id *identity.Identity) {
 	scanner := bufio.NewScanner(os.Stdin)
 	printPrompt()
 	for scanner.Scan() {
@@ -412,7 +455,7 @@ func runStdinLoop(ctx context.Context, cancel context.CancelFunc, reg *channelRe
 			if len(parts) < 3 {
 				log.Println("[USAGE] send <peer-id-hex> <text>")
 			} else {
-				sendTo(reg, parts[1], parts[2])
+				sendTo(reg, parts[1], parts[2], chatStore, history, id)
 			}
 		case "sendfile":
 			if len(parts) < 3 {
@@ -420,6 +463,8 @@ func runStdinLoop(ctx context.Context, cancel context.CancelFunc, reg *channelRe
 			} else {
 				sendFile(reg, parts[1], parts[2])
 			}
+		case "history":
+			showHistory(*history, parts[1:], id)
 		case "ping":
 			if len(parts) < 2 {
 				log.Println("[USAGE] ping <peer-id-hex>")
@@ -431,6 +476,7 @@ func runStdinLoop(ctx context.Context, cancel context.CancelFunc, reg *channelRe
 		case "help":
 			log.Println("[HELP ] send <peer-id-hex> <text>   -- send a chat message")
 			log.Println("[HELP ] sendfile <peer-id-hex> <path> -- send a file")
+			log.Println("[HELP ] history [peer-id-hex]         -- show recent chat (optionally with one peer)")
 			log.Println("[HELP ] ping <peer-id-hex>           -- send a liveness probe")
 			log.Println("[HELP ] peers                         -- (see [PEER] log lines)")
 			log.Println("[HELP ] help                          -- this list")
@@ -453,7 +499,7 @@ func printPrompt() {
 	fmt.Fprint(os.Stderr, "> ")
 }
 
-func sendTo(reg *channelRegistry, peerHex, text string) {
+func sendTo(reg *channelRegistry, peerHex, text string, chatStore *storage.Store, history *[]*storage.Record, id *identity.Identity) {
 	pid, err := hexToBytes(peerHex)
 	if err != nil {
 		log.Printf("[ERROR] bad peer id hex: %v", err)
@@ -469,6 +515,26 @@ func sendTo(reg *channelRegistry, peerHex, text string) {
 		return
 	}
 	log.Printf("[MSG  ] out >%s> %s", peerHex, text)
+	// Persist the outgoing message to the encrypted
+	// local log. We only get here on successful send
+	// (SendText returned nil), so a write failure
+	// is not "user typed in vain" — it means the
+	// peer already saw the message, the disk just
+	// didn't keep a copy. Log the failure but don't
+	// surface it to the user (they can't do anything
+	// about a write failure mid-REPL).
+	rec := &storage.Record{
+		Timestamp: time.Now().UTC(),
+		From:      id.PeerIDHex(),
+		To:        peerHex,
+		Direction: "out",
+		Body:      text,
+		MsgID:     "", // M3 v0.1: not exposed in protocol yet
+	}
+	if err := chatStore.Append(rec); err != nil {
+		log.Printf("[ERROR] chat log append: %v", err)
+	}
+	*history = append(*history, rec)
 }
 
 // sendFile streams a local file to the named peer. Blocking;
@@ -540,4 +606,56 @@ func peerHex(pid []byte) string {
 		return identityHex(pid)
 	}
 	return fmt.Sprintf("%x", pid)
+}
+func showHistory(history []*storage.Record, args []string, id *identity.Identity) {
+    // args is the slice after the "history" command
+    // word. Empty = show all peers; one element =
+    // filter to that peer-id-hex.
+    var filterPeer string
+    if len(args) >= 1 {
+        pid, err := hexToBytes(args[0])
+        if err != nil {
+            log.Printf("[ERROR] bad peer id hex: %v", err)
+            return
+        }
+        filterPeer = identityHex(pid)
+    }
+    if len(history) == 0 {
+        log.Printf("[INFO ] no chat history yet")
+        return
+    }
+    // Show the last 50 records, oldest first within
+    // the slice (so the user reads top-down). If
+    // filterPeer is set, also restrict to records
+    // where the OTHER side is filterPeer �� we accept
+    // both directions since the user may have typed
+    // either From or To of the record.
+    const limit = 50
+    start := 0
+    if len(history) > limit {
+        start = len(history) - limit
+    }
+    shown := 0
+    for i := start; i < len(history); i++ {
+        r := history[i]
+        if filterPeer != "" && r.From != filterPeer && r.To != filterPeer {
+            continue
+        }
+        arrow := ">"
+        if r.Direction == "in" {
+            arrow = "<"
+        }
+        // We log with the timestamp in local time so
+        // the user can map it to "this morning" / "last
+        // night" without having to do TZ math in their
+        // head. The on-disk format is UTC.
+        local := r.Timestamp.Local()
+        log.Printf("[HIST ] %s %s %s %s", local.Format("2006-01-02 15:04:05"), arrow, r.From, r.Body)
+        shown++
+    }
+    if shown == 0 {
+        if filterPeer != "" {
+            log.Printf("[INFO ] no history with peer %s", filterPeer)
+        }
+    }
 }
