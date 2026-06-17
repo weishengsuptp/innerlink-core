@@ -494,11 +494,27 @@ func sendFile(reg *channelRegistry, peerHex, path string) {
 			path, peerHex, sent, total, pct)
 	}
 	log.Printf("[FILE] start send peer=%s path=%s", peerHex, path)
-	if err := filetransfer.Send(context.Background(), st.ch, path, progress, st.rcv.WaitForReply); err != nil {
-		log.Printf("[ERROR] sendfile: %v", err)
-		return
-	}
-	log.Printf("[FILE] done peer=%s path=%s", peerHex, path)
+	// Run Send in a background goroutine so the REPL
+	// stays responsive while the file is in flight. Send
+	// blocks for as long as the transfer takes (could be
+	// minutes for multi-GiB files) and the REPL's
+	// bufio.Scanner is on the same goroutine as sendFile
+	// — if Send ran inline here, every keystroke the
+	// user typed during the transfer would sit unread in
+	// the stdin buffer until Send returned. The user
+	// would not be able to send chat, ping, or even
+	// "quit" while a 2 GiB file was in flight. The cost
+	// of running Send in a goroutine is one extra stack
+	// frame and a slightly noisier log (send / done
+	// interleaving with anything the user types), which
+	// is the right trade.
+	go func() {
+		if err := filetransfer.Send(context.Background(), st.ch, path, progress, st.rcv.WaitForReply); err != nil {
+			log.Printf("[ERROR] sendfile: %v", err)
+			return
+		}
+		log.Printf("[FILE] done peer=%s path=%s", peerHex, path)
+	}()
 }
 
 func pingPeer(reg *channelRegistry, peerHex string) {
