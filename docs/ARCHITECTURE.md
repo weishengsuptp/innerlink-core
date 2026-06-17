@@ -6,7 +6,7 @@
 
 ```
 ┌─────────────────────────────────────────────┐
-│          cmd/innerlink                       │  ← CLI 集成 demo（M1+M2 跑通）
+│  cmd/innerlink                       │  ← CLI 集成 demo（M1+M2+M3 跑通）
 │       （不是产品，是 core lib 的活体测试）       │
 └─────────────────────────────────────────────┘
                   │  import
@@ -42,15 +42,27 @@
         │  tjfoc/gmsm v1.4.1 │
         └──────────────────┘
 
-        ┌──────────────────┐
-        │ internal/discovery │  ← 旁路：自动发现（UDP 广播）
-        │  UDP peer announce │
-        └──────────────────┘
-                     │
-                     ▼
-        ┌──────────────────┐
-        │  internal/identity │
-        └──────────────────┘
+         ┌──────────────────┐
+         │ internal/discovery │  ← 旁路：自动发现（UDP 广播）
+         │  UDP peer announce │
+         └──────────────────┘
+                      │
+                      ▼
+         ┌──────────────────┐
+         │  internal/identity │
+         └──────────────────┘
+
+         ┌──────────────────┐
+         │  internal/storage  │  ← M3 旁路：加密本地落盘
+         │  chat.enc 加密写   │    （KDF(SM2_D) → SM4-CBC 16 B IV）
+         │  + history 加载   │
+         └──────────────────┘
+                      │
+                      ▼
+         ┌──────────────────┐
+         │  internal/crypto   │
+         │  SM2/SM3/SM4/KDF   │
+         └──────────────────┘
 ```
 
 依赖是**单向**的：上层可以 import 下层，下层不能 import 上层。这由 Go 的 `internal/` 机制 + 包路径强制。
@@ -90,9 +102,19 @@
 
 ### 2.6 测试策略
 
-- 96 个测试（unit + dispatcher e2e + logx）
-- `go test -race ./...` 必须全过
+- 110+ 个测试（unit + dispatcher e2e + logx + storage 14 个）
+- `go test ./...` 必须全过
 - VMware 双机端到端测：CI 跑不了（无网段），由人类测试者在本地跑
+- `go test -race` 在本机跑不了（无 CGO，Windows 上 race detector 依赖 C 编译器；CI Ubuntu runner 可跑）
+
+### 2.7 M3 加密本地落盘的密钥派生
+
+- `internal/storage` 的 SM4 密钥**不是独立存盘的**；每次启动从 SM2 私钥 D 用 KDF 派生
+- `storageKey = KDF(D, "innerlink-storage-v1", 16)` — 16 字节 SM4-128 key
+- D 来自 `identity.Identity.PrivateKeyD()`，永远不写盘
+- 改 info 字符串 = 烧旧 history（domain separation，不是 bug）
+- 丢 `device.key` = 丢 history（feature not bug）
+- 任何持有 device.key 的进程都能读 chat.enc；任何不持有的都拿不到 plaintext（读路径直接返回 `ErrCorrupt`，不返回 garbage）
 
 ## 3. 接口约定
 
@@ -140,9 +162,62 @@ id, created, _ := identity.LoadOrCreate("~/.innerlink/device.key")
 
 // PeerID = SM3(公钥)[:16]，hex 32 字符
 fmt.Println(id.PeerIDHex())
+
+// 暴露给 M3 storage 用
+deviceD := id.PrivateKeyD()  // 32 B SM2 私钥 D
 ```
 
-## 4. 性能预算（v0.2 实测）
+### 3.4 storage（M3 落盘 + history）
+
+```go
+// 启动时打开
+store, err := storage.Open(saveDir, id.PrivateKeyD())
+defer store.Close()
+
+// 启动时加载历史
+records, err := store.ReadAll()  // 启动时一次性 in-memory 加载
+
+// 收到 / 发出 chat 时 append
+store.Append(&storage.Record{
+    Timestamp: time.Now().UTC(),
+    From:      peerHex,
+    To:        id.PeerIDHex(),
+    Direction: "in",  // 或 "out"
+    Body:      string(env.Payload),
+})
+
+// REPL 的 history 命令走 in-memory slice
+for i := max(0, len(records)-50); i < len(records); i++ {
+    rec := records[i]
+    fmt.Printf("%s %s %s %s\n", rec.Timestamp.Local().Format(...), rec.Direction, peerShort(rec.From), rec.Body)
+}
+```
+
+**帧格式**（append-only self-describing）：
+
+```
+[4 B big-endian ciphertext length]
+[16 B IV]
+[N B SM4-CBC ciphertext of PKCS#7-padded JSON]
+```
+
+JSON 明文：
+
+```json
+{
+  "v": 1,
+  "ts": "2026-06-17T03:19:28.702Z",
+  "from": "268fb7ee158d35160ef9ef76e0977f2a",
+  "to":   "d50fdc68d3def9e0207fef011c678571",
+  "dir":  "in",
+  "body": "你好",
+  "msgID": ""
+}
+```
+
+> `msgID` 字段在 v0.1 留空 — 它是 v0.3 协议引入 AAD 时会填的。文件层已经准备好接，未来不破坏格式。
+
+## 4. 性能预算（v0.3 实测）
 
 | 指标 | 实测值 |
 |---|---|
@@ -150,7 +225,9 @@ fmt.Println(id.PeerIDHex())
 | chat 消息端到端时延 | < 20ms |
 | 2 GiB 文件跨 VMware 传输 | ~120s（受磁盘 IO 限制，不是协议） |
 | `innerlink.exe` 大小 | 5.1 MB（upx 之前） |
-| CI 全量测试 + race | ~5 min |
+| M3 chat.enc 写延迟（每条） | < 5ms（KDF 一次启动，crypto 在内存） |
+| M3 chat.enc 启动加载 1000 条 | < 50ms（SM4 解密 + JSON 反序列化） |
+| CI 全量测试 | ~5 min（CI 上 race detector 可跑） |
 
 ## 5. 失败模式
 
@@ -161,6 +238,8 @@ fmt.Println(id.PeerIDHex())
 | 设备密钥泄露 | 隐私全无 | README 强调保管 device.key |
 | 网络掉线 / 进程被杀 | channel 60s read deadline 后关 | dispatcher log + 上层 UI 重连 |
 | 握手超时 | 5s 后报 handshake timeout | 上层 UI 显式提示 |
+| 设备密钥丢失 / device.key 被删 | history 显示 corrupt | 退出时不 panic，REPL 显式提示 `ErrCorrupt` |
+| chat.enc 文件被外部截断 / 篡改 | ReadAll 解析到一半停 | 启动时丢弃 corrupt tail（`ErrCorrupt` + 提示截断点） |
 
 ## 6. 仓库布局
 
@@ -178,7 +257,7 @@ D:\innerlink
 │   ├── protocol/              Envelope + Channel
 │   ├── filetransfer/          分片 + SHA-256 校验
 │   ├── logx/                  日志级别 + 文件 sink
-│   └── storage/               (M3) 加密落盘
+│   └── storage/               M3 ✅ 加密落盘 + history
 ├── docs/
 │   ├── PRD.md                 产品需求
 │   └── ARCHITECTURE.md        ← 你正在看

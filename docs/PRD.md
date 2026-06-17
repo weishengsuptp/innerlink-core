@@ -1,7 +1,7 @@
 # innerlink-core 产品需求（PRD）
 
-> 版本：v0.2（2026-06-17）
-> 状态：M1 / M2 已完成，M3 准备中
+> 版本：v0.3（2026-06-17）
+> 状态：M1 / M2 / M3 已完成，M4 规划中
 > 阅读对象：项目协作者、AI 智能体（Mavis）、测试者
 
 ---
@@ -46,13 +46,36 @@
 
 分片（256 KiB/chunk）+ 每片 SHA-256 + 全文件 SHA-256 校验 + cmd dispatcher 集成。VMware 双机 2 GiB 文件 2 分钟传输完成，期间双方仍可互发聊天。
 
-### M3 — 加密本地存储（准备中）
+### M3 — 加密本地存储 ✅（v0.3，2026-06-17）
 
-`internal/storage/` 计划：SM4-CBC + 设备密钥加密 chat log 落盘，默认存 `~/Downloads/innerlink/`。设计原则：
+`internal/storage/` 完成：SM4-CBC + 设备密钥派生，加密落盘 `chat.enc`（默认 `~/Downloads/innerlink/chat.enc`）。cmd REPL 新增 `history` 命令（无参显示最近 50 条；带 peer-id-hex 参数则过滤该 peer）。
 
-- 每条消息一个 record，JSON 索引 + 加密 payload
-- ping / pong 不落盘
-- 默认保存 90 天，可调
+**设计原则（落地版）**：
+
+- 每条 chat envelope 一个加密 record（in 跟 out 都落盘）
+- 帧格式自描述：`[4B BE ctLen][16B IV][N B SM4-CBC ct]`；明文 = JSON `{v, ts, from, to, dir, body, msgID}` + PKCS#7 padding
+- 密钥派生：`KDF(SM2_D, "innerlink-storage-v1", 16)` — 改 info 字符串 = 烧旧 history（domain separation）
+- fsync 节奏：每 10 条 record 强制 sync 一次（power-loss 最多丢 9 条）；Close 强制 final sync
+- ping / pong **不落盘**（v0.1 范围）
+- 设备密钥丢失 = history 不可读（feature not bug — 密钥永不下盘）
+
+**实测**（VMware 双机，2026-06-17）：
+
+- 聊 10 条 chat → 退出 → 重启 → `chat log: 10 records loaded` 提示
+- `history` 跟 `history <peer-id-hex>` 都正确
+- `chat.enc` 文件存在，notepad 打开是密文（符合预期）
+- 跟 M2 的 `.incoming/` 目录共存，互不干扰
+
+**测试**：`internal/storage/storage_test.go` 14 个测试全过（wrong-key、并发、Unicode、64 KiB 大 body、version 校验等）。
+
+**v0.1 明确不做的**（PRD 出 v0.3 后才提的、避免 scope creep）：
+
+- 90 天自动 rotate
+- chat 全文搜索 / 导出
+- ping / pong 落盘
+- 文件附件落盘
+- mlock'd key material
+- per-peer 独立文件
 
 ### M4 — 关系与单元测试（规划中）
 
@@ -84,12 +107,13 @@
 
 - **模块路径**：`github.com/weishengsuptp/innerlink-core`
 - **许可证**：Apache 2.0
-- **CI**：GitHub Actions，3 平台 (Ubuntu / Windows / macOS) build + test + race detector
+- **CI**：GitHub Actions，3 平台 (Ubuntu / Windows / macOS) build + test
 - **依赖**：仅 `github.com/tjfoc/gmsm` + `golang.org/x/sys`（gmsm 的间接依赖），**无 CGO、无 GUI 框架、无 SQL 驱动**
+- **测试规模**（v0.3 末）：9 个 internal 包，110+ 个测试，全过
 - **AI 协作**：本仓库由 [Mavis](https://github.com/MiniMax-AI)（minimax code 智能体）配合人类测试者协作开发，commit message 都是 Mavis 写的口气。
 
 ## 7. 下一步
 
-1. 实现 M3 storage（`internal/storage/`，SM4-CBC + 设备密钥）
-2. 改进多 peer 同步：当前 channelRegistry 已经按 peerID 索引，但要测一下 N peer 同时活跃的稳定性
-3. v0.3 协议：加 AAD（用 MsgID 做 AAD），加重放窗口（每 Channel 一个 ring buffer）
+1. 改进多 peer 同步：当前 channelRegistry 已经按 peerID 索引，但要测一下 N peer 同时活跃的稳定性
+2. M4 关系层：peer 别名 + 协议 v2 草案
+3. M5 API 冻结 + 第三方密码学审计
