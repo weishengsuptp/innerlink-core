@@ -138,3 +138,85 @@ routes by `env.Type`.
   - `Receiver.Handle(ctx, env)` — receive-one-envelope;
     use from a shared dispatcher (the cmd/innerlink CLI
     pattern).
+
+## Sender.Send must NOT call ch.Recv when a dispatcher is reading (踩过的坑)
+
+The cmd/innerlink dispatcher pump is the one goroutine
+that calls `Channel.Recv`. Inside the dispatcher's
+goroutine, it routes every envelope by `env.Type` —
+chat / ping / pong inline, file traffic through
+`Receiver.Handle`. This means **no other code on the
+sender side may also call `Channel.Recv`** while the
+dispatcher is reading, or they will race for the next
+envelope and the dispatcher will swallow Accept / Done
+as "non-file traffic".
+
+The original `filetransfer.Send` called `ch.Recv` directly
+to wait for the Accept / Done envelopes, which raced the
+dispatcher in the cmd/innerlink CLI and made every
+sendfile from that CLI hang at 60 s with
+`wait accept: context deadline exceeded`.
+
+**Rule:** when a sender wants to wait for a reply
+envelope on a channel that is also being read by a
+dispatcher, do NOT call `ch.Recv` directly. Instead, use
+`filetransfer.WaitForReplyFunc`, and the dispatcher's
+`Receiver.Handle` will route the reply to you. The
+default value of `WaitForReplyFunc` (when the caller
+passes `nil`) is a direct `ch.Recv` loop, which is only
+correct when the caller is the sole reader — i.e. the
+file-only test paths in `filetransfer_test.go` /
+`dispatcher_e2e_test.go` where the test stands up its
+own loopback pair and doesn't share the channel with a
+chat pump.
+
+The `Receiver.WaitForReply` API also keeps a small
+`pendingReplies` cache so that Accept envelopes emitted
+synchronously from `handleOffer` (which is the normal
+case) are still delivered to a `Send` that registers
+its wait channel slightly after the Accept arrived.
+
+## cmd/innerlink REPL goroutine must not block on Send (踩过的坑)
+
+`runStdinLoop` is a single goroutine that owns the
+`bufio.Scanner` over `os.Stdin`. If you call
+`filetransfer.Send` (or any blocking call) inline from
+inside the switch that handles `sendfile`, the entire
+REPL blocks until Send returns — minutes, for a 2 GiB
+file. Every keystroke the user types sits in the stdin
+buffer and is processed all at once when Send finally
+returns.
+
+**Rule:** any command handler in `runStdinLoop` that
+might block for more than ~10 ms (sendfile, future
+"send-many-files in a queue", …) must run in a
+`go func() { ... }()`. The cost is one extra stack
+frame and slightly noisier log ordering (the
+`[FILE] done` may now interleave with chat the user
+sent during the transfer), which is the right trade.
+
+## cmd/innerlink log volume scales with file size — gate by level (踩过的坑)
+
+A 2 GiB sendfile produces 2048 `[FILE] recv chunk ...`
+log lines on the receiver side and ~200 `[FILE] sending
+... %` progress lines on the sender side, plus the
+sender's per-frame `json.Marshal` cost. At default log
+level these flood the screen and dwarf every other log
+line.
+
+**Rule:** any per-chunk / per-progress log line in
+`internal/filetransfer` or `internal/transport` must
+be classified as `LevelDebug` (i.e. hidden by default)
+in the tag-to-level table inside `internal/logx`. Use
+`-log-level=debug` to see them when debugging. The
+file sink (`-log-file=innerlink.log`) is the right
+place to capture a 2 GiB sendfile's worth of debug
+output for offline analysis — much easier than
+scrolling the terminal scrollback.
+
+To add a new line: pick a tag from the table in
+`internal/logx/logx.go` (the `classify` method) and
+add a test case to `TestClassify` so the mapping is
+pinned. If the line is high-frequency, give it a body
+prefix that `classify` can detect (e.g. `[FILE] recv
+chunk ...` → debug).
