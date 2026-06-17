@@ -172,6 +172,23 @@ func NewAnnouncer(d Device, name string, tcpPort uint16) *Announcer {
 	}
 }
 
+// NewAnnouncerOnPort is NewAnnouncer but on a caller-chosen UDP
+// port. The e2e tests in tests/e2e use it to spin up multiple
+// instances on one machine without collisions; production code
+// should keep using NewAnnouncer + DefaultPort.
+func NewAnnouncerOnPort(d Device, name string, tcpPort, udpPort uint16) *Announcer {
+	return &Announcer{
+		id:       d,
+		name:     name,
+		tcpPort:  tcpPort,
+		port:     int(udpPort),
+		interval: DefaultInterval,
+		timeout:  DefaultPeerTimeout,
+		peers:    make(map[string]*Peer),
+		events:   make(chan PeerEvent, 32),
+	}
+}
+
 // Peers returns a snapshot of the current peer table.
 // The returned slice is freshly allocated; mutating it is safe
 // but mutating any Peer struct inside it is not.

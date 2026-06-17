@@ -59,3 +59,24 @@ func defaultSaveDir() (string, error) {
 	}
 	return filepath.Join(home, "Downloads", "innerlink"), nil
 }
+
+// resolveSaveDir returns the user-supplied -save-dir if non-empty,
+// otherwise the defaultSaveDir. The directory is NOT created here;
+// that's the Receiver and Storage layer's job.
+func resolveSaveDir(flagValue string) (string, error) {
+	if flagValue != "" {
+		return flagValue, nil
+	}
+	return defaultSaveDir()
+}
+
+// resolveDeviceKey returns the user-supplied -device-key if non-empty,
+// otherwise identity.ResolveDeviceKeyPath's default. The e2e tests
+// use a per-node temp file so two instances have different
+// long-term identities and can talk to each other.
+func resolveDeviceKey(flagValue string) (string, error) {
+	if flagValue != "" {
+		return flagValue, nil
+	}
+	return identity.ResolveDeviceKeyPath()
+}

@@ -326,6 +326,20 @@ func NewTransport() *Transport {
 	}
 }
 
+// NewTransportOnPort is NewTransport but on a caller-chosen TCP
+// port. The e2e tests in tests/e2e use it to spin up multiple
+// instances on one machine without collisions; production code
+// should keep using NewTransport + DefaultPort.
+func NewTransportOnPort(port int) *Transport {
+	return &Transport{
+		port:      port,
+		heartbeat: DefaultHeartbeat,
+		conns:     make(map[string]*Conn),
+		inbounds:  make(chan *Conn, 8),
+		closed:    make(chan struct{}),
+	}
+}
+
 // Listen binds the TCP listener. Must be called before Run.
 func (t *Transport) Listen() error {
 	l, err := net.Listen("tcp", fmt.Sprintf(":%d", t.port))

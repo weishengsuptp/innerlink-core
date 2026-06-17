@@ -89,6 +89,27 @@ func run() error {
 		"path of the log file (in addition to stderr). "+
 			"Use \"\" to disable file output. The file is "+
 			"appended, so successive runs share the same log.")
+	udpPort := flag.Uint("udp-port", uint(discovery.DefaultPort),
+		"UDP port for peer discovery. Default matches the "+
+			"default discovery port. The e2e tests pick a free "+
+			"port per node so multiple instances can run on "+
+			"one machine.")
+	tcpPort := flag.Uint("tcp-port", uint(transport.DefaultPort),
+		"TCP port for incoming peer connections. Default "+
+			"matches the default transport port. The e2e "+
+			"tests pick a free port per node.")
+	deviceKey := flag.String("device-key", "",
+		"path to the SM2 device key file. Empty (the "+
+			"default) means ~/.innerlink/device.key. The e2e "+
+			"tests use a per-node temp file so two instances "+
+			"have different PeerIDs and can talk to each "+
+			"other without sharing a long-term identity.")
+	saveDir := flag.String("save-dir", "",
+		"directory for incoming files and the encrypted "+
+			"chat log (chat.enc). Empty (the default) means "+
+			"~/Downloads/innerlink. The e2e tests use a per-"+
+			"node temp dir so two instances don't share "+
+			"a single chat.enc.")
 	flag.Parse()
 
 	if err := logx.Setup(logx.Options{
@@ -101,7 +122,7 @@ func run() error {
 	defer logx.Close()
 
 	// 1) Device identity.
-	keyPath, err := identity.ResolveDeviceKeyPath()
+	keyPath, err := resolveDeviceKey(*deviceKey)
 	if err != nil {
 		return fmt.Errorf("resolve device key path: %w", err)
 	}
@@ -120,7 +141,7 @@ func run() error {
 	defer cancel()
 
 	// 2) UDP announcer.
-	ann := discovery.NewAnnouncer(id, hostname(), transport.DefaultPort)
+	ann := discovery.NewAnnouncerOnPort(id, hostname(), uint16(*tcpPort), uint16(*udpPort))
 	go func() {
 		if err := ann.Run(ctx); err != nil && ctx.Err() == nil {
 			log.Printf("[ERROR] announcer: %v", err)
@@ -128,26 +149,26 @@ func run() error {
 	}()
 
 	// 3) TCP transport.
-	tr := transport.NewTransport()
+	tr := transport.NewTransportOnPort(int(*tcpPort))
 	if err := tr.Listen(); err != nil {
 		return fmt.Errorf("transport listen: %w", err)
 	}
-	log.Printf("[INFO ] listening for peers on UDP :%d", discovery.DefaultPort)
-	log.Printf("[INFO ] listening for peers on TCP :%d", transport.DefaultPort)
+	log.Printf("[INFO ] listening for peers on UDP :%d", *udpPort)
+	log.Printf("[INFO ] listening for peers on TCP :%d", *tcpPort)
 	go func() {
 		if err := tr.Run(ctx); err != nil && ctx.Err() == nil {
 			log.Printf("[ERROR] transport: %v", err)
 		}
 	}()
 
-	// Default save dir for incoming files AND for the
-	// encrypted chat log (chat.enc). Created on first
-	// use by the Receiver and the Storage layer.
-	saveDir, err := defaultSaveDir()
+	// Save dir for incoming files AND for the encrypted
+	// chat log (chat.enc). Created on first use by the
+	// Receiver and the Storage layer.
+	resolvedSaveDir, err := resolveSaveDir(*saveDir)
 	if err != nil {
 		return fmt.Errorf("resolve save dir: %w", err)
 	}
-	log.Printf("[INFO ] incoming files save dir: %s", saveDir)
+	log.Printf("[INFO ] incoming files save dir: %s", resolvedSaveDir)
 
 	// M3: encrypted chat log. The Store derives its SM4
 	// key from id.PrivateKeyD(), so the same device.key
@@ -156,7 +177,7 @@ func run() error {
 	// (wrong key) we treat both as "no history yet" —
 	// the chat log is best-effort, never blocking the
 	// user from chatting.
-	chatStore, err := storage.Open(saveDir, id.PrivateKeyD())
+	chatStore, err := storage.Open(resolvedSaveDir, id.PrivateKeyD())
 	if err != nil {
 		return fmt.Errorf("open chat log: %w", err)
 	}
@@ -187,7 +208,7 @@ func run() error {
 				if !ok {
 					return
 				}
-				go handleInbound(ctx, id, inbound, channels, saveDir, chatStore, historyPtr)
+				go handleInbound(ctx, id, inbound, channels, resolvedSaveDir, chatStore, historyPtr)
 			}
 		}
 	}()
@@ -198,7 +219,7 @@ func run() error {
 			switch ev.Type {
 			case discovery.PeerAdded:
 				log.Printf("[PEER ] joined   peer=%s at %s", peerHex(ev.PeerID), ev.Peer.Addr)
-				go dialAndHandshake(ctx, id, tr, ev.Peer, channels, saveDir, chatStore, historyPtr)
+				go dialAndHandshake(ctx, id, tr, ev.Peer, channels, resolvedSaveDir, chatStore, historyPtr)
 			case discovery.PeerRemoved:
 				log.Printf("[PEER ] left     peer=%s", peerHex(ev.PeerID))
 			}
@@ -206,7 +227,7 @@ func run() error {
 	}()
 
 	// Stdin command loop.
-	go runStdinLoop(ctx, cancel, channels, chatStore, historyPtr, id)
+	go runStdinLoop(ctx, cancel, channels, chatStore, historyPtr, id, tr, resolvedSaveDir)
 
 	// Wait for Ctrl+C.
 	<-ctx.Done()
@@ -342,6 +363,46 @@ func handleInbound(ctx context.Context, id *identity.Identity, conn *transport.C
 	wrapChannel(ctx, conn, sess, reg, saveDir, chatStore, history, id)
 }
 
+// dialAddr is the manual-connect counterpart to
+// dialAndHandshake: it skips the UDP discovery path
+// and goes straight to transport.Dial + handshake.
+// Returns immediately; the handshake runs in a
+// background goroutine.
+//
+// Why this exists: the discovery layer deliberately
+// skips loopback interfaces, so two innerlink
+// instances on the same host (which is what the e2e
+// tests in tests/e2e do) never see each other over
+// UDP. The dial command lets a user / test force
+// the connection. It's also a useful escape hatch
+// for cross-subnet peers, where the broadcast
+// yellow pages can't reach.
+func dialAddr(ctx context.Context, id *identity.Identity, tr *transport.Transport, addr string, reg *channelRegistry, saveDir string, chatStore *storage.Store, history *[]*storage.Record) {
+	go func() {
+		dctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		conn, err := tr.Dial(dctx, addr)
+		if err != nil {
+			log.Printf("[ERROR] dial %s: %v", addr, err)
+			return
+		}
+		sess, err := handshake.RunAsInitiator(dctx, id, conn)
+		if err != nil {
+			log.Printf("[ERROR] handshake (initiator) with %s: %v", addr, err)
+			return
+		}
+		// We don't know the peerID until the handshake
+		// finishes. Now we do. Use the same guard
+		// dialAndHandshake uses (but inline, since we
+		// don't have a *discovery.Peer).
+		if reg.get(sess.RemotePeerID) != nil {
+			return
+		}
+		log.Printf("[HANDS] ok       peer=%s (initiator) addr=%s", peerHex(sess.RemotePeerID), addr)
+		wrapChannel(ctx, conn, sess, reg, saveDir, chatStore, history, id)
+	}()
+}
+
 // wrapChannel takes a freshly-handed-shaked Conn+Session and
 // constructs a Channel. Starts:
 //   - a Recv pump for chat traffic (text/ping/pong),
@@ -439,7 +500,7 @@ func wrapChannel(ctx context.Context, conn *transport.Conn, sess *handshake.Sess
 //   - ping <peer-id-hex>           send a ping
 //   - help                         list commands
 //   - quit                         exit
-func runStdinLoop(ctx context.Context, cancel context.CancelFunc, reg *channelRegistry, chatStore *storage.Store, history *[]*storage.Record, id *identity.Identity) {
+func runStdinLoop(ctx context.Context, cancel context.CancelFunc, reg *channelRegistry, chatStore *storage.Store, history *[]*storage.Record, id *identity.Identity, tr *transport.Transport, saveDir string) {
 	scanner := bufio.NewScanner(os.Stdin)
 	printPrompt()
 	for scanner.Scan() {
@@ -473,11 +534,29 @@ func runStdinLoop(ctx context.Context, cancel context.CancelFunc, reg *channelRe
 			}
 		case "peers":
 			log.Printf("[INFO ] no peer listing in v0.1; check the [PEER] log lines above")
+		case "dial":
+			// dial <ip:port>  -- bypass UDP discovery and
+			// connect directly to a known peer. Useful in
+			// two cases:
+			//   1. e2e tests on a single host (loopback
+			//      is not in the broadcast set; see
+			//      internal/discovery.broadcastAddresses).
+			//   2. cross-subnet peers (the discovery
+			//      yellow-pages only work on the local
+			//      broadcast domain). Production users
+			//      can `dial 192.168.2.5:4748` to reach
+			//      a peer on a different subnet.
+			if len(parts) < 2 {
+				log.Println("[USAGE] dial <ip:port>")
+			} else {
+				dialAddr(ctx, id, tr, parts[1], reg, saveDir, chatStore, history)
+			}
 		case "help":
 			log.Println("[HELP ] send <peer-id-hex> <text>   -- send a chat message")
 			log.Println("[HELP ] sendfile <peer-id-hex> <path> -- send a file")
 			log.Println("[HELP ] history [peer-id-hex]         -- show recent chat (optionally with one peer)")
 			log.Println("[HELP ] ping <peer-id-hex>           -- send a liveness probe")
+			log.Println("[HELP ] dial <ip:port>               -- connect directly (skip discovery)")
 			log.Println("[HELP ] peers                         -- (see [PEER] log lines)")
 			log.Println("[HELP ] help                          -- this list")
 			log.Println("[HELP ] quit                          -- exit")
