@@ -291,8 +291,13 @@ func TestListWithNamesDeterministic(t *testing.T) {
 }
 
 func TestDefaultPath(t *testing.T) {
-	got := DefaultPath(`C:\Users\liul\.innerlink\device.key`)
-	want := `C:\Users\liul\.innerlink\aliases.json`
+	// Use platform-native path separators so the
+	// test passes on Windows AND on macOS/Linux.
+	// The hard-coded "C:\Users\liul\..." in earlier
+	// versions broke the macOS CI build.
+	deviceKey := filepath.Join("home", "alice", ".innerlink", "device.key")
+	want := filepath.Join("home", "alice", ".innerlink", "aliases.json")
+	got := DefaultPath(deviceKey)
 	if got != want {
 		t.Errorf("DefaultPath = %q, want %q", got, want)
 	}
