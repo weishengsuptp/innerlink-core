@@ -23,18 +23,13 @@ import (
 // the test binary is the driver, not what we want to
 // run — we want the innerlink binary to spawn.
 func TestMain(m *testing.M) {
-	fmt.Fprintf(os.Stderr, "e2e: TestMain entry\n")
-	err := ensureBinary()
-	fmt.Fprintf(os.Stderr, "e2e: TestMain: ensureBinary returned err=%v\n", err)
-	if err != nil {
+	if err := ensureBinary(); err != nil {
 		// We don't os.Exit here; the test will
 		// fail loudly when StartNode tries to
 		// find the binary. Printing to stderr
 		// makes the failure visible even if
 		// the test never runs.
 		os.Stderr.WriteString("e2e: ensureBinary failed: " + err.Error() + "\n")
-	} else {
-		fmt.Fprintf(os.Stderr, "e2e: ensureBinary OK\n")
 	}
 	os.Exit(m.Run())
 }
@@ -56,7 +51,6 @@ func ensureBinary() error {
 	// when cwd is the package dir.
 	bin := filepath.Join(repoRoot, binPath())
 	if _, err := os.Stat(bin); err == nil {
-		fmt.Fprintf(os.Stderr, "e2e: ensureBinary: ALREADY EXISTS %s\n", bin)
 		return nil
 	}
 	if err := os.MkdirAll(filepath.Dir(bin), 0o755); err != nil {
@@ -66,16 +60,9 @@ func ensureBinary() error {
 	cmd.Dir = repoRoot
 	cmd.Stderr = os.Stderr
 	cmd.Stdout = os.Stdout
-	fmt.Fprintf(os.Stderr, "e2e: ensureBinary: cwd=%s repoRoot=%s target=%s\n", wd, repoRoot, bin)
 	if err := cmd.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "e2e: ensureBinary: go build failed: %v\n", err)
-		return err
+		return fmt.Errorf("go build (cwd=%s): %w", repoRoot, err)
 	}
-	if _, err := os.Stat(bin); err != nil {
-		fmt.Fprintf(os.Stderr, "e2e: ensureBinary: build returned 0 but binary still missing at %s\n", bin)
-		return err
-	}
-	fmt.Fprintf(os.Stderr, "e2e: ensureBinary: built %s\n", bin)
 	return nil
 }
 

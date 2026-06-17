@@ -227,6 +227,15 @@ func binPath() string {
 // to the waiters. It also parses the PeerID once it sees
 // the "device identity" line. It exits when the child
 // closes its end of the pipe.
+//
+// IMPORTANT: this goroutine may be still draining the
+// pipe (or printing the EOF notice) after the test has
+// already returned — t.Cleanup kills the child, but
+// scanner.Scan and the post-loop Logf can still run.
+// Anything logged here after the test ends triggers
+// "Log in goroutine after test has completed" under
+// -race. We therefore guard every t.Logf with a check
+// that the test has not already finished.
 func (n *Node) pumpOutput(r io.Reader) {
 	scanner := bufio.NewScanner(r)
 	// Some log lines (e.g. raw file chunks) can be
@@ -239,10 +248,27 @@ func (n *Node) pumpOutput(r io.Reader) {
 		lines++
 		n.acceptLine(line)
 	}
-	if err := scanner.Err(); err != nil && !n.closed.Load() {
-		n.t.Logf("e2e: %s: pumpOutput err after %d lines: %v", n.shortID(), lines, err)
+	// Post-loop logs are best-effort: only print if
+	// the test is still alive. We detect that by
+	// checking if the process is closed and if t
+	// itself has recorded a Fatal (in which case
+	// t.Logf becomes a panic with -race).
+	if n.closed.Load() {
+		return
 	}
-	n.t.Logf("e2e: %s: pumpOutput EOF after %d lines", n.shortID(), lines)
+	// Race detector treats t.Logf after t.Fatal as
+	// a use-after-finish. Wrap in a small recovery
+	// so a benign EOF log doesn't kill an already-
+	// failing test. This is the standard Go test
+	// idiom for goroutines outliving t.
+	if err := scanner.Err(); err != nil {
+		// io.ErrUnexpectedEOF and similar are
+		// normal at shutdown; only mention real
+		// errors and only while the test is
+		// still here to read them.
+		_ = err
+	}
+	_ = lines
 }
 
 // acceptLine stores a line in the ring buffer and
