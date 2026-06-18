@@ -618,6 +618,9 @@ func wrapChannel(ctx context.Context, conn *transport.Conn, sess *handshake.Sess
 	// and the payload is tiny (a few KB even at
 	// 100 peers).
 	sendRosterSync(ctx, ch, rosterStore)
+	// v0.5.3: also send our scan history so the
+	// peer can skip subnets we already covered.
+	sendScanHistory(ctx, ch, autoScan)
 	go func() {
 		defer reg.delete(sess.RemotePeerID)
 		for {
@@ -704,6 +707,15 @@ func wrapChannel(ctx context.Context, conn *transport.Conn, sess *handshake.Sess
 					// propagates one hop per
 					// channel-ready event.
 					broadcastRosterToAll(ctx, reg, rosterStore, sess.RemotePeerID)
+					// v0.5.3: also push our scan
+					// history. The peer we just
+					// heard from likely just told
+					// us about a new /24 — let our
+					// other peers know we (or
+					// someone) already covered it.
+					if autoScan != nil {
+						broadcastScanHistoryToAll(ctx, reg, autoScan, sess.RemotePeerID)
+					}
 					// v0.5.2: each newly-learned
 					// peer might be on a /24 we
 					// haven't seen. Enqueue scans
@@ -719,6 +731,32 @@ func wrapChannel(ctx context.Context, conn *transport.Conn, sess *handshake.Sess
 					}
 				} else {
 					log.Printf("[ROSTER] sync from %s: 0 new (already known)", peerHexStr)
+				}
+			case protocol.TypeScanHistory:
+				// v0.5.3: peer is telling us
+				// "I've already scanned these
+				// /24s this session, so don't
+				// re-scan them". Merge their
+				// list into our knownSubnets
+				// (which is what shouldAutoScanFor
+				// reads). No push-on-change —
+				// scan history is a hint, not
+				// authoritative state; the
+				// peer's own auto-scan queue
+				// keeps their own list.
+				var sh protocol.ScanHistory
+				if err := json.Unmarshal(env.Payload, &sh); err != nil {
+					log.Printf("[ERROR] scan-history unmarshal: %v", err)
+					break
+				}
+				if autoScan != nil {
+					for _, c := range sh.Scanned {
+						autoScan.MarkScanned(c)
+					}
+					if len(sh.Scanned) > 0 {
+						log.Printf("[SCAN-HIST] learned %d scanned subnet(s) from %s",
+							len(sh.Scanned), peerHexStr)
+					}
 				}
 			default:
 				// File traffic and anything else: let the
@@ -783,6 +821,43 @@ func broadcastRosterToAll(ctx context.Context, reg *channelRegistry, store *rost
 			continue
 		}
 		sendRosterSync(ctx, st.ch, store)
+	}
+}
+
+// sendScanHistory sends the v0.5.3 scan-history
+// gossip envelope to one peer. The payload is the
+// list of /24 subnets this node has scanned (or
+// has a live connection to) this session. The
+// receiver merges these into its knownSubnets set
+// so it won't re-scan a /24 another node already
+// covered. Errors are logged, not fatal — gossip
+// is best-effort.
+func sendScanHistory(ctx context.Context, ch *protocol.Channel, autoScan *autoScanState) {
+	_, seen := autoScan.Queue().Snapshot()
+	wire := protocol.ScanHistory{Scanned: seen}
+	payload, err := json.Marshal(wire)
+	if err != nil {
+		log.Printf("[ERROR] scan-history marshal: %v", err)
+		return
+	}
+	if err := ch.Send(ctx, protocol.Envelope{
+		Type:    protocol.TypeScanHistory,
+		Payload: payload,
+	}); err != nil {
+		log.Printf("[ERROR] scan-history send: %v", err)
+	}
+}
+
+// broadcastScanHistoryToAll fans the local scan
+// history out to every active channel. Same
+// push-on-change pattern as broadcastRosterToAll.
+func broadcastScanHistoryToAll(ctx context.Context, reg *channelRegistry, autoScan *autoScanState, exclude []byte) {
+	all := reg.snapshot()
+	for _, st := range all {
+		if bytes.Equal(st.peerID, exclude) {
+			continue
+		}
+		sendScanHistory(ctx, st.ch, autoScan)
 	}
 }
 

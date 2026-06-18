@@ -108,6 +108,26 @@ const (
 	// payload is small enough (100 entries * ~100 bytes =
 	// ~10KB) that the simplicity beats the bandwidth saving.
 	TypeRosterSync MsgType = "roster-sync"
+
+	// -- Scan history (v0.5.3) --
+
+	// TypeScanHistory carries the list of /24
+	// subnets a node has already scanned this
+	// session. When peer A runs `scan 10.0.0.0/24`
+	// (or auto-scan does it), it remembers that
+	// subnet in its own queue. It then gossips
+	// the list to peers so they can skip the same
+	// scan — without this, two nodes on the same
+	// LAN might each trigger a scan for the same
+	// new /24 they learned about from a third peer.
+	//
+	// The history is session-only (a restart
+	// empties it). Scan is cheap, so re-scanning
+	// after a restart is acceptable. The set is
+	// bounded in practice by the v0.5.2 queue
+	// capacity (16) + subnets we connected to,
+	// so a few dozen entries.
+	TypeScanHistory MsgType = "scan-history"
 )
 
 // Envelope is the application-level message structure that gets
@@ -142,6 +162,18 @@ type RosterEntry struct {
 // direct observation is authoritative).
 type RosterSync struct {
 	Entries []RosterEntry `json:"entries"`
+}
+
+// ScanHistory is the payload of a TypeScanHistory
+// envelope. Scanned is the list of /24 subnets
+// (e.g. "192.168.40.0/24") that the sender has
+// already scanned this session — both via the
+// manual `scan <cidr>` command and via v0.5.2
+// auto-scan. The receiver merges these into its
+// own knownSubnets set so it does not re-scan
+// the same /24.
+type ScanHistory struct {
+	Scanned []string `json:"scanned"`
 }
 
 // Channel is a single encrypted message stream between two peers.
