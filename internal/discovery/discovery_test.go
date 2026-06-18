@@ -469,5 +469,123 @@ func makePacket(d *fakeDevice, name string, tcpPort uint16, seq uint64) ([]byte,
 	return json.Marshal(ann)
 }
 
+// ---------------------------------------------------------------------------
+// LocalAddr / pickLocalIPv4 — v0.5 "by default, just works on LAN"
+// ---------------------------------------------------------------------------
+
+// TestPickLocalIPv4_NotEmpty just sanity-checks the
+// helper doesn't panic and returns something. On a
+// developer box with at least one non-loopback NIC
+// (which is every machine on a LAN), this returns a
+// real IPv4. In a CI container with only loopback,
+// it returns "0.0.0.0" — we still want a non-panic,
+// non-error return so the caller can fall through.
+func TestPickLocalIPv4_NotEmpty(t *testing.T) {
+	ip := pickLocalIPv4()
+	if ip == "" {
+		t.Error("pickLocalIPv4 returned empty string")
+	}
+	// The returned string is either "0.0.0.0" (no
+	// suitable NIC) or a real IPv4. Anything else
+	// is a bug.
+	if ip != "0.0.0.0" {
+		parsed := net.ParseIP(ip)
+		if parsed == nil {
+			t.Errorf("pickLocalIPv4 = %q, not parseable as IP", ip)
+		}
+		if parsed.To4() == nil {
+			t.Errorf("pickLocalIPv4 = %q, not an IPv4", ip)
+		}
+	}
+}
+
+// TestPickLocalIPv4_SkipsLoopbackAndLinkLocal confirms
+// the helper filters out addresses that aren't
+// routable for "dial in from another peer" purposes.
+// We can't easily forge an interface list (it's
+// derived from the OS), so this is a property check:
+// if the test machine has a non-loopback IPv4 at all,
+// the returned IP is not in 127.x.x.x or 169.254.x.x.
+func TestPickLocalIPv4_SkipsLoopbackAndLinkLocal(t *testing.T) {
+	ip := pickLocalIPv4()
+	if ip == "0.0.0.0" {
+		t.Skip("no non-loopback IPv4 on this machine")
+	}
+	parsed := net.ParseIP(ip)
+	if parsed.IsLoopback() {
+		t.Errorf("pickLocalIPv4 = %q, should not be loopback", ip)
+	}
+	if parsed.IsLinkLocalUnicast() {
+		t.Errorf("pickLocalIPv4 = %q, should not be link-local (169.254.x.x)", ip)
+	}
+}
+
+// TestAnnouncerLocalAddr_ExplicitBindWins is the
+// "user passed -bind=192.168.40.5" path. Whatever
+// pickLocalIPv4 would return, the explicit bindIP
+// must take precedence — otherwise -bind is broken.
+func TestAnnouncerLocalAddr_ExplicitBindWins(t *testing.T) {
+	// We don't need to actually start the announcer
+	// (Run binds the UDP socket). NewAnnouncerOnPortBind
+	// sets bindIP; LocalAddr reads it.
+	a := NewAnnouncerOnPortBind(nil, "test", 4748, 4747, "192.168.40.5")
+	got := a.LocalAddr()
+	want := "192.168.40.5:4748"
+	if got != want {
+		t.Errorf("LocalAddr = %q, want %q (explicit bind must win)", got, want)
+	}
+}
+
+// TestAnnouncerLocalAddr_LoopbackBind works on a
+// dev box that has no non-loopback IPv4 (CI
+// containers, sometimes). The e2e tests use this
+// to make tests deterministic. The picker is not
+// called in this path because bindIP is set to
+// 127.0.0.1 explicitly.
+func TestAnnouncerLocalAddr_LoopbackBind(t *testing.T) {
+	a := NewAnnouncerOnPortBind(nil, "test", 4748, 4747, "127.0.0.1")
+	got := a.LocalAddr()
+	want := "127.0.0.1:4748"
+	if got != want {
+		t.Errorf("LocalAddr = %q, want %q", got, want)
+	}
+}
+
+// TestAnnouncerLocalAddr_AutoPick is the "by default,
+// just works on a LAN" path. No -bind flag was set,
+// so bindIP is "0.0.0.0". The helper should pick a
+// real local IPv4 (or fall back to "0.0.0.0" on a
+// machine with no NIC). We assert the result is one
+// of those two — never an empty string, never with
+// loopback.
+func TestAnnouncerLocalAddr_AutoPick(t *testing.T) {
+	a := NewAnnouncerOnPort(nil, "test", 4748, 4747) // default 0.0.0.0 bind
+	got := a.LocalAddr()
+	// The picked IP + port. Format: "ip:port".
+	host, port, err := net.SplitHostPort(got)
+	if err != nil {
+		t.Fatalf("LocalAddr = %q, not host:port: %v", got, err)
+	}
+	if port != "4748" {
+		t.Errorf("port = %q, want 4748", port)
+	}
+	// host is either "0.0.0.0" (no NIC found) or
+	// a real IPv4. If it's a real IP, it must not
+	// be loopback or link-local.
+	if host != "0.0.0.0" {
+		parsed := net.ParseIP(host)
+		if parsed == nil {
+			t.Errorf("LocalAddr host = %q, not parseable", host)
+		} else {
+			if parsed.IsLoopback() {
+				t.Errorf("LocalAddr = %q, picker returned loopback (should skip 127.x.x.x)", got)
+			}
+			if parsed.IsLinkLocalUnicast() {
+				t.Errorf("LocalAddr = %q, picker returned link-local (should skip 169.254.x.x)", got)
+			}
+		}
+	}
+}
+
 // guard so unused import warnings don't break the build.
 var _ = sync.Mutex{}

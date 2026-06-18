@@ -36,6 +36,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"time"
 )
@@ -205,29 +206,87 @@ func NewAnnouncerOnPortBind(d Device, name string, tcpPort, udpPort uint16, bind
 	}
 }
 
-// LocalAddr returns the local address the announcer's
-// UDP socket is bound to. Used by the v0.5 roster sync
-// to fill in our own peer entry with the right
-// "ip:port that other peers can reach me at" — they
-// can't dial 0.0.0.0, they need the routable local
-// IP. Must be called after Run() (the socket is opened
-// there). If Run hasn't started yet, returns
-// 127.0.0.1:<port> as a safe-but-useless fallback.
+// LocalAddr returns the local address other peers
+// should dial to reach this announcer. Used by the
+// v0.5 roster sync to fill in our own peer entry.
 //
-// If the bound IP is 0.0.0.0 (the default — listen on
-// all interfaces), the returned string still contains
-// 0.0.0.0, which is not dialable. Callers that need a
-// real address for the roster should use a bound IP
-// (see the -bind CLI flag in cmd/innerlink).
+// Resolution order:
+//
+//  1. The user explicitly passed -bind=<ip> on the
+//     CLI. Use that IP + tcpPort. Always wins.
+//
+//  2. The UDP socket is already bound to a specific
+//     IP (i.e. -bind was set in stone at Run time).
+//     Use the socket's local address. Always wins.
+//
+//  3. Neither: the UDP socket is bound to 0.0.0.0
+//     (the default — listen on all interfaces). We
+//     enumerate the local interfaces and return the
+//     first non-loopback, non-link-local IPv4. This
+//     is the "by default, just works on a LAN"
+//     path: the user runs innerlink without -bind
+//     on a workstation with one NIC, the roster
+//     publishes a real routable address, other
+//     peers can dial in.
+//
+//  4. Pre-Run (socket not yet opened) AND no -bind:
+//     same as case 3, but pickLocalIPv4 is called
+//     even before Run. Same answer, no race.
+//
+// On a machine with no non-loopback IPv4 (rare —
+// CI containers, weird networks), pickLocalIPv4
+// returns "0.0.0.0" and we degrade to that. The
+// user can then pass -bind=127.0.0.1 to make e2e
+// tests work in that environment.
 func (a *Announcer) LocalAddr() string {
-	if a.conn != nil {
-		return a.conn.LocalAddr().String()
+	// (1) explicit user override always wins
+	if a.bindIP != "" && a.bindIP != "0.0.0.0" {
+		return fmt.Sprintf("%s:%d", a.bindIP, a.tcpPort)
 	}
-	// Pre-Run fallback. tcpPort is the one we tell other
-	// peers to dial, so this is at least directionally
-	// correct (the IP is the loopback only because we
-	// don't know better yet).
-	return fmt.Sprintf("%s:%d", a.bindIP, a.tcpPort)
+	// (2) socket bound to a specific IP (only
+	// possible if the user override was propagated
+	// to the socket — see bindBroadcastSocket)
+	if a.conn != nil {
+		if addr := a.conn.LocalAddr().String(); !strings.HasPrefix(addr, "0.0.0.0:") {
+			return addr
+		}
+	}
+	// (3)/(4) default: pick a real local IP
+	return fmt.Sprintf("%s:%d", pickLocalIPv4(), a.tcpPort)
+}
+
+// pickLocalIPv4 returns the first non-loopback,
+// non-link-local IPv4 address on the local machine.
+// Returns "0.0.0.0" as a last-ditch fallback when no
+// suitable interface is found (containers, weird
+// networks). The order is "as net.InterfaceAddrs
+// returns it" — which on most systems is interface
+// creation order, not necessarily the most useful.
+// For a typical single-NIC workstation, that's fine:
+// there's exactly one candidate, and we return it.
+func pickLocalIPv4() string {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return "0.0.0.0"
+	}
+	for _, a := range addrs {
+		var ip net.IP
+		switch v := a.(type) {
+		case *net.IPNet:
+			ip = v.IP
+		case *net.IPAddr:
+			ip = v.IP
+		}
+		if ip == nil || ip.IsLoopback() || ip.IsLinkLocalUnicast() {
+			continue
+		}
+		ip4 := ip.To4()
+		if ip4 == nil {
+			continue // skip IPv6
+		}
+		return ip4.String()
+	}
+	return "0.0.0.0"
 }
 
 // Peers returns a snapshot of the current peer table.
