@@ -575,6 +575,86 @@ func TestE2E_ThreePeerMesh(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// E2E roster gossip: A↔B, B↔C, all 3 nodes see all 3 in `roster`
+// ---------------------------------------------------------------------------
+
+// TestE2E_RosterGossip verifies the M5 gossip protocol.
+// We stand up A, B, C such that A and C never directly
+// connect — only A↔B and B↔C handshakes happen. Within
+// seconds, the gossip should have propagated: A learns
+// about C through B (and vice versa), so all three
+// nodes' `roster` command should list all three peers
+// (A, B, C) with the right per-node online indicator.
+//
+// What "success" looks like in the logs:
+//   - A's log: [ROSTER] sync from B: 1 new entry: cID
+//   - C's log: [ROSTER] sync from B: 1 new entry: aID
+//   - All three nodes' `roster` command output
+//     contains each other's peer IDs.
+//
+// Failure modes caught here:
+//   - Gossip not sent on channel ready
+//   - Gossip sent but not received
+//   - Merge broken (entries not added)
+//   - Self-merge bug (we add ourselves with a 0-IP
+//     and the network never sees us)
+func TestE2E_RosterGossip(t *testing.T) {
+	alloc := NewPortAllocator()
+	a := StartNode(t, alloc, "A")
+	b := StartNode(t, alloc, "B")
+	c := StartNode(t, alloc, "C")
+
+	// Chain: A↔B, B↔C. A and C never directly
+	// connect — their only way to learn about each
+	// other is through B's gossip.
+	a.Send("dial 127.0.0.1:" + strconv.Itoa(b.TCPPort()))
+	gotPeerReady(t, a, b)
+	gotPeerReady(t, b, a)
+	b.Send("dial 127.0.0.1:" + strconv.Itoa(c.TCPPort()))
+	gotPeerReady(t, b, c)
+	gotPeerReady(t, c, b)
+
+	// A should learn about C from B's gossip.
+	// The chain: B↔C channel ready → C's roster
+	// reaches B → B's MergeFromGossip sees C as
+	// new → broadcastRosterToAll pushes B's
+	// updated roster to A → A merges the new C
+	// entry. We wait for the C peer-id prefix
+	// to appear in any roster log line on A
+	// (could be a sync message, could be the
+	// roster command output, doesn't matter).
+	cIDPrefix := c.PeerID()[:8]
+	a.WaitForLogContains(cIDPrefix, 5*time.Second)
+
+	// C should similarly learn about A through B.
+	aIDPrefix := a.PeerID()[:8]
+	c.WaitForLogContains(aIDPrefix, 5*time.Second)
+
+	// Now check: each node's `roster` command
+	// must show all three peer IDs.
+	aID := a.PeerID()
+	bID := b.PeerID()
+	cID := c.PeerID()
+	for _, n := range []*Node{a, b, c} {
+		n.Send("roster")
+		// Each roster row prints the first 8 chars
+		// of the peer ID followed by "...". We wait
+		// for all three to appear. Allow 5s for the
+		// pumpOutput goroutine to flush the log line
+		// to the ring buffer.
+		for _, wantID := range []string{aID, bID, cID} {
+			prefix := wantID[:8]
+			n.WaitForLog(regexp.MustCompile(regexp.QuoteMeta(prefix)+`\.\.\.`), 5*time.Second)
+		}
+		// No bleed-back: the command should show
+		// the "3 entries" header (i.e., all three
+		// peers but no duplicates / no half-merged
+		// ghost entries from previous tests).
+		n.WaitForLog(regexp.MustCompile(`\[ROSTER\] 3 entries:`), 5*time.Second)
+	}
+}
+
 // startNodeWithArgs is the low-level constructor. It
 // does NOT wait for readiness; both StartNode and
 // StartNodeWithOptions call it and then wait.
@@ -604,6 +684,7 @@ func startNodeWithArgs(t *testing.T, ports Pair, deviceKey, saveDir string) *Nod
 		"-device-key=" + deviceKey,
 		"-save-dir=" + saveDir,
 		"-log-file=" + logFile,
+		"-bind=127.0.0.1",
 		"-log-level=info",
 	}
 	cmd := exec.Command(binaryPath, args...)

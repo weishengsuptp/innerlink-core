@@ -41,6 +41,7 @@ func TestNewLayout_Defaults(t *testing.T) {
 		{"DeviceKey", l.DeviceKey, baseFor(baseFor(cwd, ".innerlink"), "device.key")},
 		{"Aliases", l.Aliases, baseFor(baseFor(cwd, ".innerlink"), "aliases.json")},
 		{"ChatLog", l.ChatLog, baseFor(baseFor(cwd, ".innerlink"), "chat.enc")},
+		{"Roster", l.Roster, baseFor(baseFor(cwd, ".innerlink"), "roster.json")},
 		{"Received", l.Received, baseFor(cwd, "received")},
 		{"LogFile", l.LogFile, baseFor(cwd, "innerlink.log")},
 	}

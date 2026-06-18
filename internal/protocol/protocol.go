@@ -93,6 +93,21 @@ const (
 	// TypeFileAbort is sent by either side to cancel the transfer.
 	//   {fileID, reason}
 	TypeFileAbort MsgType = "file-abort"
+
+	// -- Roster sync (v0.5 / M5) --
+
+	// TypeRosterSync carries one peer's view of the LAN roster
+	// (the "phone book" of every peer this node has heard
+	// about). Payload is a JSON-encoded roster.Envelope:
+	//   {host_peer_id, host_hostname, entries:[Entry...]}
+	// where each Entry is {peer_id, hostname, addrs, first_seen}.
+	//
+	// Sync is one-shot: when two peers establish a channel,
+	// each side sends its roster to the other, and both sides
+	// merge. There is no incremental diff protocol — the
+	// payload is small enough (100 entries * ~100 bytes =
+	// ~10KB) that the simplicity beats the bandwidth saving.
+	TypeRosterSync MsgType = "roster-sync"
 )
 
 // Envelope is the application-level message structure that gets
@@ -105,6 +120,28 @@ type Envelope struct {
 	TS      int64     `json:"ts"`  // unix milliseconds
 	MsgID   []byte    `json:"mid"` // 8 bytes, random per message
 	Payload []byte    `json:"p"`   // type-specific (for text: utf-8 string bytes)
+}
+
+// RosterEntry is one row of the LAN peer directory as it
+// appears on the wire in a TypeRosterSync envelope. Kept
+// here (rather than in the roster package) so the wire
+// format stays self-contained: the protocol package
+// never imports roster, and the conversion from
+// roster.Entry to RosterEntry lives in the cmd layer.
+type RosterEntry struct {
+	PeerID    string    `json:"peer_id"`
+	Hostname  string    `json:"hostname"`
+	Addrs     []string  `json:"addrs"`
+	FirstSeen time.Time `json:"first_seen"`
+}
+
+// RosterSync is the payload of a TypeRosterSync envelope.
+// One node sends its full view of "every peer I've heard
+// about on the LAN" to another node. The receiver merges
+// new entries (existing entries are kept as-is — local
+// direct observation is authoritative).
+type RosterSync struct {
+	Entries []RosterEntry `json:"entries"`
 }
 
 // Channel is a single encrypted message stream between two peers.

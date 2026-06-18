@@ -8,15 +8,19 @@ import (
 )
 
 // bindBroadcastSocket creates a UDP socket on the given port and
-// configures it for broadcasting.
+// bind IP, and configures it for broadcasting.
 //
 // On Windows the SO_BROADCAST option is set via syscall (or, more
 // portably, the SetSocketOpt API on the raw conn). Windows allows
 // broadcast sends by default for unbound UDP sockets, but we set
 // the option explicitly so the behavior matches POSIX and we don't
 // depend on undocumented defaults.
-func bindBroadcastSocket(port int) (*net.UDPConn, error) {
-	addr := &net.UDPAddr{IP: net.IPv4zero, Port: port}
+func bindBroadcastSocket(port int, bindIP string) (*net.UDPConn, error) {
+	ip := net.ParseIP(bindIP)
+	if ip == nil {
+		ip = net.IPv4zero
+	}
+	addr := &net.UDPAddr{IP: ip, Port: port}
 	conn, err := net.ListenUDP("udp4", addr)
 	if err != nil {
 		return nil, err

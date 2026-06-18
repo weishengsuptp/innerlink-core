@@ -10,13 +10,17 @@ import (
 )
 
 // bindBroadcastSocket creates a UDP socket on the given port and
-// configures it for broadcasting.
+// bind IP, and configures it for broadcasting.
 //
 // On POSIX (Linux / macOS), we need to explicitly enable
 // SO_BROADCAST — without it, the kernel refuses to send to
 // broadcast addresses with EACCES.
-func bindBroadcastSocket(port int) (*net.UDPConn, error) {
-	addr := &net.UDPAddr{IP: net.IPv4zero, Port: port}
+func bindBroadcastSocket(port int, bindIP string) (*net.UDPConn, error) {
+	ip := net.ParseIP(bindIP)
+	if ip == nil {
+		ip = net.IPv4zero
+	}
+	addr := &net.UDPAddr{IP: ip, Port: port}
 	conn, err := net.ListenUDP("udp4", addr)
 	if err != nil {
 		return nil, err

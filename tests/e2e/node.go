@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -101,6 +102,7 @@ func StartNode(t *testing.T, allocator *PortAllocator, name string) *Node {
 		"-device-key=" + keyPath,
 		"-save-dir=" + dir,
 		"-log-file=" + logFile,
+		"-bind=127.0.0.1",
 		"-log-level=info",
 	}
 	cmd := exec.Command(binaryPath, args...)
@@ -398,6 +400,34 @@ func (n *Node) WaitForLogDesc(pattern *regexp.Regexp, timeout time.Duration, des
 		n.t.Fatalf("e2e: %s: timed out after %s waiting for log %q\nrecent logs:\n%s",
 			n.shortID(), timeout, desc, n.recentLogs(20))
 	}
+}
+
+// WaitForLogContains is a substring-based variant of
+// WaitForLog. Used by tests that just want to wait
+// for any log line mentioning a specific token
+// (e.g. a peer-id prefix), without crafting a regex.
+// It scans the ring buffer once per check; for a
+// "wait for the line to arrive" guarantee it loops
+// every 50ms until the substring shows up or the
+// timeout fires.
+func (n *Node) WaitForLogContains(token string, timeout time.Duration) {
+	n.t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		for _, line := range n.SnapshotLogs() {
+			if strings.Contains(line, token) {
+				return
+			}
+		}
+		select {
+		case <-n.doneCh:
+			n.t.Fatalf("e2e: %s: process exited before log containing %q arrived", n.shortID(), token)
+		case <-time.After(50 * time.Millisecond):
+			// keep polling
+		}
+	}
+	n.t.Fatalf("e2e: %s: timed out after %s waiting for log containing %q\nrecent logs:\n%s",
+		n.shortID(), timeout, token, n.recentLogs(20))
 }
 
 // SnapshotLogs returns a chronological copy of the full log

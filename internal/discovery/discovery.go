@@ -107,6 +107,7 @@ type Announcer struct {
 	name     string        // our display name
 	tcpPort  uint16        // our innerlink TCP port
 	port     int           // UDP port to use
+	bindIP   string        // local IP to bind UDP to (default "0.0.0.0")
 	interval time.Duration // broadcast / timeout granularity
 	timeout  time.Duration // peer timeout
 
@@ -177,16 +178,56 @@ func NewAnnouncer(d Device, name string, tcpPort uint16) *Announcer {
 // instances on one machine without collisions; production code
 // should keep using NewAnnouncer + DefaultPort.
 func NewAnnouncerOnPort(d Device, name string, tcpPort, udpPort uint16) *Announcer {
+	return NewAnnouncerOnPortBind(d, name, tcpPort, udpPort, "0.0.0.0")
+}
+
+// NewAnnouncerOnPortBind is the bind-IP-aware variant.
+// Pass a routable local IP (e.g. "127.0.0.1" for
+// loopback, "192.168.40.5" for a specific NIC) when
+// the default 0.0.0.0 (all interfaces) would yield an
+// un-dialable LocalAddr() in the v0.5 roster. On a
+// dev box with one NIC, picking 127.0.0.1 is the
+// safest way to make the e2e tests deterministic.
+func NewAnnouncerOnPortBind(d Device, name string, tcpPort, udpPort uint16, bindIP string) *Announcer {
+	if bindIP == "" {
+		bindIP = "0.0.0.0"
+	}
 	return &Announcer{
 		id:       d,
 		name:     name,
 		tcpPort:  tcpPort,
 		port:     int(udpPort),
+		bindIP:   bindIP,
 		interval: DefaultInterval,
 		timeout:  DefaultPeerTimeout,
 		peers:    make(map[string]*Peer),
 		events:   make(chan PeerEvent, 32),
 	}
+}
+
+// LocalAddr returns the local address the announcer's
+// UDP socket is bound to. Used by the v0.5 roster sync
+// to fill in our own peer entry with the right
+// "ip:port that other peers can reach me at" — they
+// can't dial 0.0.0.0, they need the routable local
+// IP. Must be called after Run() (the socket is opened
+// there). If Run hasn't started yet, returns
+// 127.0.0.1:<port> as a safe-but-useless fallback.
+//
+// If the bound IP is 0.0.0.0 (the default — listen on
+// all interfaces), the returned string still contains
+// 0.0.0.0, which is not dialable. Callers that need a
+// real address for the roster should use a bound IP
+// (see the -bind CLI flag in cmd/innerlink).
+func (a *Announcer) LocalAddr() string {
+	if a.conn != nil {
+		return a.conn.LocalAddr().String()
+	}
+	// Pre-Run fallback. tcpPort is the one we tell other
+	// peers to dial, so this is at least directionally
+	// correct (the IP is the loopback only because we
+	// don't know better yet).
+	return fmt.Sprintf("%s:%d", a.bindIP, a.tcpPort)
 }
 
 // Peers returns a snapshot of the current peer table.
@@ -218,7 +259,7 @@ func (a *Announcer) Events() <-chan PeerEvent {
 //   - read loop:       blocks on the UDP socket, parses announcements
 //   - gc loop:         ticks every `interval`, evicts stale peers
 func (a *Announcer) Run(ctx context.Context) error {
-	conn, err := bindBroadcastSocket(a.port)
+	conn, err := bindBroadcastSocket(a.port, a.bindIP)
 	if err != nil {
 		return fmt.Errorf("discovery: bind UDP port %d: %w", a.port, err)
 	}

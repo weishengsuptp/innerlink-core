@@ -57,6 +57,8 @@ type Layout struct {
 	Aliases string
 	// ChatLog is the encrypted chat history (M3). Default: <DataDir>/chat.enc
 	ChatLog string
+	// Roster is the peer directory JSON (M5 gossip). Default: <DataDir>/roster.json
+	Roster string
 	// Received is the directory for incoming files (M2). Default: <cwd>/received
 	Received string
 	// LogFile is the log destination. Default: <cwd>/innerlink.log
@@ -72,6 +74,7 @@ type Overrides struct {
 	DataDir   string // -data-dir
 	DeviceKey string // -device-key
 	Aliases   string // -aliases (rare; usually derived from DataDir)
+	Roster    string // -roster (rare; usually derived from DataDir)
 	SaveDir   string // -save-dir (overrides Received)
 	LogFile   string // -log-file
 }
@@ -126,6 +129,17 @@ func NewLayout(cwd string, o Overrides) (Layout, error) {
 
 	chatLog := filepath.Join(dataDir, "chat.enc")
 
+	// Roster: the LAN peer directory. M5 gossip keeps
+	// this loosely consistent across nodes; the file
+	// itself is just local persistence so a restart
+	// doesn't lose the "phone book".
+	roster := o.Roster
+	if roster == "" {
+		roster = filepath.Join(dataDir, "roster.json")
+	} else if !filepath.IsAbs(roster) {
+		roster = filepath.Join(cwd, roster)
+	}
+
 	// 3. Received directory. Lives next to .innerlink (sibling),
 	//    not inside it, so the user can browse received files
 	//    without clicking through a hidden folder.
@@ -151,6 +165,7 @@ func NewLayout(cwd string, o Overrides) (Layout, error) {
 		DeviceKey: deviceKey,
 		Aliases:   aliases,
 		ChatLog:   chatLog,
+		Roster:    roster,
 		Received:  received,
 		LogFile:   logFile,
 	}, nil

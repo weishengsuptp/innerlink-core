@@ -32,7 +32,10 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"encoding/hex"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -50,6 +53,7 @@ import (
 	"github.com/weishengsuptp/innerlink-core/internal/logx"
 	"github.com/weishengsuptp/innerlink-core/internal/paths"
 	"github.com/weishengsuptp/innerlink-core/internal/protocol"
+	"github.com/weishengsuptp/innerlink-core/internal/roster"
 	"github.com/weishengsuptp/innerlink-core/internal/storage"
 	"github.com/weishengsuptp/innerlink-core/internal/alias"
 	"github.com/weishengsuptp/innerlink-core/internal/transport"
@@ -114,6 +118,13 @@ func run() error {
 		"directory for incoming files. Default: "+
 			"<cwd>/received. The e2e tests use a per-node "+
 			"temp dir so two instances don't share state.")
+	bindIP := flag.String("bind", "0.0.0.0",
+		"local IP to bind the UDP discovery socket to. "+
+			"Default 0.0.0.0 (all interfaces). Set to a "+
+			"specific IP (e.g. 127.0.0.1 on a dev box, or "+
+			"192.168.40.5 for a single-NIC LAN host) so "+
+			"the v0.5 roster publishes a routable address "+
+			"instead of 0.0.0.0, which is not dialable.")
 	flag.Parse()
 
 	// All on-disk state and runtime files are described by a
@@ -164,7 +175,7 @@ func run() error {
 	defer cancel()
 
 	// 2) UDP announcer.
-	ann := discovery.NewAnnouncerOnPort(id, hostname(), uint16(*tcpPort), uint16(*udpPort))
+	ann := discovery.NewAnnouncerOnPortBind(id, hostname(), uint16(*tcpPort), uint16(*udpPort), *bindIP)
 	go func() {
 		if err := ann.Run(ctx); err != nil && ctx.Err() == nil {
 			log.Printf("[ERROR] announcer: %v", err)
@@ -236,6 +247,40 @@ func run() error {
 	}()
 	log.Printf("[INFO ] alias file: %s", layout.Aliases)
 
+	// M5: peer roster. The "phone book" of every peer
+	// we've heard about on the LAN, kept loosely
+	// consistent across nodes via gossip on every
+	// channel-ready event. First launch creates the
+	// file on the first Save; Open on a missing file
+	// is fine.
+	rosterStore, err := roster.Open(layout.Roster)
+	if err != nil {
+		return fmt.Errorf("open roster: %w", err)
+	}
+	defer func() {
+		if err := rosterStore.Close(); err != nil {
+			log.Printf("[ERROR] close roster: %v", err)
+		}
+	}()
+	log.Printf("[INFO ] roster file: %s", layout.Roster)
+
+	// Self entry. We always include ourselves in our
+	// own roster so the first channel-ready send
+	// already tells the other side "this is how you
+	// reach me". The address is the local IP:port
+	// the announcer is bound to — that's the address
+	// remote peers will dial.
+	selfEntry := roster.Entry{
+		PeerID:   id.PeerIDHex(),
+		Hostname: hostname(),
+		Addrs:    []string{ann.LocalAddr()},
+	}
+	if _, err := rosterStore.Add(selfEntry); err != nil {
+		return fmt.Errorf("roster: add self: %w", err)
+	}
+	log.Printf("[INFO ] self in roster: %s @ %s (%s)",
+		selfEntry.PeerID, selfEntry.Hostname, selfEntry.Addrs[0])
+
 	// 4) + 5) Glue: discovery → dial → handshake → channel.
 	channels := newChannelRegistry()
 	defer channels.closeAll()
@@ -250,7 +295,7 @@ func run() error {
 				if !ok {
 					return
 				}
-				go handleInbound(ctx, id, inbound, channels, layout.Received, chatStore, historyPtr, aliasStore)
+				go handleInbound(ctx, id, inbound, channels, layout.Received, chatStore, historyPtr, aliasStore, rosterStore)
 			}
 		}
 	}()
@@ -262,7 +307,7 @@ func run() error {
 			case discovery.PeerAdded:
 				log.Printf("[PEER ] joined   peer=%s at %s", peerHex(ev.PeerID), ev.Peer.Addr)
 				aliasStore.Touch(peerHex(ev.PeerID))
-				go dialAndHandshake(ctx, id, tr, ev.Peer, channels, layout.Received, chatStore, historyPtr, aliasStore)
+				go dialAndHandshake(ctx, id, tr, ev.Peer, channels, layout.Received, chatStore, historyPtr, aliasStore, rosterStore)
 			case discovery.PeerRemoved:
 				log.Printf("[PEER ] left     peer=%s", peerHex(ev.PeerID))
 			}
@@ -270,7 +315,7 @@ func run() error {
 	}()
 
 	// Stdin command loop.
-	go runStdinLoop(ctx, cancel, channels, chatStore, historyPtr, id, tr, layout.Received, aliasStore)
+	go runStdinLoop(ctx, cancel, channels, chatStore, historyPtr, id, tr, layout.Received, aliasStore, rosterStore)
 
 	// Wait for Ctrl+C.
 	<-ctx.Done()
@@ -291,8 +336,9 @@ func run() error {
 // must not call ch.Recv directly when the dispatcher is also
 // reading from the channel.
 type channelState struct {
-	ch  *protocol.Channel
-	rcv *filetransfer.Receiver
+	ch     *protocol.Channel
+	rcv    *filetransfer.Receiver
+	peerID []byte // 16-byte raw peer id (key in the registry)
 }
 
 type channelRegistry struct {
@@ -302,6 +348,22 @@ type channelRegistry struct {
 
 func newChannelRegistry() *channelRegistry {
 	return &channelRegistry{m: make(map[string]*channelState)}
+}
+
+// snapshot returns a slice copy of all current channel
+// states. Used by the M5 gossip fan-out (broadcast
+// roster to every connected peer) and by any future
+// "send to all" feature. The returned states are
+// shallow copies of pointers — the underlying Channel
+// is shared, so callers must not close them.
+func (r *channelRegistry) snapshot() []*channelState {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]*channelState, 0, len(r.m))
+	for _, st := range r.m {
+		out = append(out, st)
+	}
+	return out
 }
 
 // set installs state for peerID. If a Channel already exists for
@@ -358,7 +420,7 @@ func (r *channelRegistry) closeAll() {
 // check is done here rather than at the call site so that races
 // between two simultaneous dialAndHandshake goroutines for the
 // same peer also collapse to a single connection.
-func dialAndHandshake(ctx context.Context, id *identity.Identity, tr *transport.Transport, p *discovery.Peer, reg *channelRegistry, saveDir string, chatStore *storage.Store, history *[]*storage.Record, aliasStore *alias.Store) {
+func dialAndHandshake(ctx context.Context, id *identity.Identity, tr *transport.Transport, p *discovery.Peer, reg *channelRegistry, saveDir string, chatStore *storage.Store, history *[]*storage.Record, aliasStore *alias.Store, rosterStore *roster.Store) {
 	if p.Addr == nil {
 		return
 	}
@@ -389,12 +451,12 @@ func dialAndHandshake(ctx context.Context, id *identity.Identity, tr *transport.
 		return
 	}
 	log.Printf("[HANDS] ok       peer=%s (initiator)", peerHex(p.PeerID))
-	wrapChannel(ctx, conn, sess, reg, saveDir, chatStore, history, id, aliasStore)
+	wrapChannel(ctx, conn, sess, reg, saveDir, chatStore, history, id, aliasStore, rosterStore)
 }
 
 // handleInbound is the responder counterpart: another peer
 // dialed us, ran the handshake; we accept and wrap.
-func handleInbound(ctx context.Context, id *identity.Identity, conn *transport.Conn, reg *channelRegistry, saveDir string, chatStore *storage.Store, history *[]*storage.Record, aliasStore *alias.Store) {
+func handleInbound(ctx context.Context, id *identity.Identity, conn *transport.Conn, reg *channelRegistry, saveDir string, chatStore *storage.Store, history *[]*storage.Record, aliasStore *alias.Store, rosterStore *roster.Store) {
 	hctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	sess, err := handshake.RunAsResponder(hctx, id, conn)
@@ -403,7 +465,7 @@ func handleInbound(ctx context.Context, id *identity.Identity, conn *transport.C
 		return
 	}
 	log.Printf("[HANDS] ok       peer=%s (responder)", peerHex(sess.RemotePeerID))
-	wrapChannel(ctx, conn, sess, reg, saveDir, chatStore, history, id, aliasStore)
+	wrapChannel(ctx, conn, sess, reg, saveDir, chatStore, history, id, aliasStore, rosterStore)
 }
 
 // dialAddr is the manual-connect counterpart to
@@ -420,7 +482,7 @@ func handleInbound(ctx context.Context, id *identity.Identity, conn *transport.C
 // the connection. It's also a useful escape hatch
 // for cross-subnet peers, where the broadcast
 // yellow pages can't reach.
-func dialAddr(ctx context.Context, id *identity.Identity, tr *transport.Transport, addr string, reg *channelRegistry, saveDir string, chatStore *storage.Store, history *[]*storage.Record, aliasStore *alias.Store) {
+func dialAddr(ctx context.Context, id *identity.Identity, tr *transport.Transport, addr string, reg *channelRegistry, saveDir string, chatStore *storage.Store, history *[]*storage.Record, aliasStore *alias.Store, rosterStore *roster.Store) {
 	go func() {
 		dctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
@@ -442,7 +504,7 @@ func dialAddr(ctx context.Context, id *identity.Identity, tr *transport.Transpor
 			return
 		}
 		log.Printf("[HANDS] ok       peer=%s (initiator) addr=%s", peerHex(sess.RemotePeerID), addr)
-		wrapChannel(ctx, conn, sess, reg, saveDir, chatStore, history, id, aliasStore)
+		wrapChannel(ctx, conn, sess, reg, saveDir, chatStore, history, id, aliasStore, rosterStore)
 	}()
 }
 
@@ -454,7 +516,7 @@ func dialAddr(ctx context.Context, id *identity.Identity, tr *transport.Transpor
 //
 // saveDir is where completed incoming files land. If empty,
 // defaults to <home>/Downloads/innerlink.
-func wrapChannel(ctx context.Context, conn *transport.Conn, sess *handshake.Session, reg *channelRegistry, saveDir string, chatStore *storage.Store, history *[]*storage.Record, id *identity.Identity, aliasStore *alias.Store) {
+func wrapChannel(ctx context.Context, conn *transport.Conn, sess *handshake.Session, reg *channelRegistry, saveDir string, chatStore *storage.Store, history *[]*storage.Record, id *identity.Identity, aliasStore *alias.Store, rosterStore *roster.Store) {
 	// M4: bump last_seen on every channel open. The
 	// discovery layer also Touches on PeerAdded, so
 	// a peer that announces but never connects still
@@ -463,6 +525,14 @@ func wrapChannel(ctx context.Context, conn *transport.Conn, sess *handshake.Sess
 	// peer connects (dial or accept) and we have a
 	// confirmed handshake.
 	aliasStore.Touch(peerHex(sess.RemotePeerID))
+
+	// M5: same touch for the roster (the "phone book").
+	// The handshake proves this peerID is real and
+	// reachable; the roster is the long-term
+	// "peers I've heard about" view, so an active
+	// channel is the strongest possible signal that
+	// the peer is current.
+	rosterStore.Touch(peerHex(sess.RemotePeerID))
 
 	ch, err := protocol.NewChannel(conn, sess)
 	if err != nil {
@@ -485,7 +555,7 @@ func wrapChannel(ctx context.Context, conn *transport.Conn, sess *handshake.Sess
 		_ = ch.Close()
 		return
 	}
-	if !reg.set(sess.RemotePeerID, &channelState{ch: ch, rcv: rcv}) {
+	if !reg.set(sess.RemotePeerID, &channelState{ch: ch, rcv: rcv, peerID: append([]byte(nil), sess.RemotePeerID...)}) {
 		// Race lost: another Channel for this peer was installed
 		// first. Close this one and bail without starting the
 		// Recv goroutine — the winner's goroutine already owns
@@ -495,6 +565,15 @@ func wrapChannel(ctx context.Context, conn *transport.Conn, sess *handshake.Sess
 		return
 	}
 	log.Printf("[INFO ] channel ready peer=%s", peerHexStr)
+
+	// M5 gossip: send our roster to the new peer
+	// right now, so the LAN-wide peer directory
+	// converges fast on connect. Both sides send,
+	// both sides merge — a one-shot full-list
+	// exchange is simpler than incremental diff
+	// and the payload is tiny (a few KB even at
+	// 100 peers).
+	sendRosterSync(ctx, ch, rosterStore)
 	go func() {
 		defer reg.delete(sess.RemotePeerID)
 		for {
@@ -537,6 +616,53 @@ func wrapChannel(ctx context.Context, conn *transport.Conn, sess *handshake.Sess
 				// the alias last-seen timestamp.
 				log.Printf("[MSG  ] in  <%s> pong", peerHexStr)
 				aliasStore.Touch(peerHexStr)
+			case protocol.TypeRosterSync:
+				// M5: another node is telling us
+				// about every peer it knows. We
+				// merge the new entries into our
+				// roster and log how many were
+				// new. We don't act on the new
+				// peers here (no auto-dial) —
+				// that's the heartbeat's job, see
+				// the periodic presence check in
+				// run(). Triggering an immediate
+				// dial would race the REPL and
+				// surprise the user.
+				var rs protocol.RosterSync
+				if err := json.Unmarshal(env.Payload, &rs); err != nil {
+					log.Printf("[ERROR] roster sync parse: %v", err)
+					break
+				}
+				remote := make([]roster.Entry, 0, len(rs.Entries))
+				for _, e := range rs.Entries {
+					remote = append(remote, roster.Entry{
+						PeerID:    e.PeerID,
+						Hostname:  e.Hostname,
+						Addrs:     e.Addrs,
+						FirstSeen: e.FirstSeen,
+					})
+				}
+				added, err := rosterStore.MergeFromGossip(remote)
+				if err != nil {
+					log.Printf("[ERROR] roster merge: %v", err)
+					break
+				}
+				if err := rosterStore.Save(); err != nil {
+					log.Printf("[ERROR] roster save: %v", err)
+				}
+				if len(added) > 0 {
+					log.Printf("[ROSTER] sync from %s: %d new entries: %s",
+						peerHexStr, len(added), strings.Join(added, ", "))
+					// Push-on-change: we just learned
+					// about new peers, so tell our
+					// other connected peers too.
+					// Without this, gossip only
+					// propagates one hop per
+					// channel-ready event.
+					broadcastRosterToAll(ctx, reg, rosterStore, sess.RemotePeerID)
+				} else {
+					log.Printf("[ROSTER] sync from %s: 0 new (already known)", peerHexStr)
+				}
 			default:
 				// File traffic and anything else: let the
 				// file receiver own it. Handle() is also
@@ -550,6 +676,59 @@ func wrapChannel(ctx context.Context, conn *transport.Conn, sess *handshake.Sess
 	}()
 }
 
+// sendRosterSync encodes the local roster and ships
+// it to one peer as a TypeRosterSync envelope. Called
+// right after every channel-ready event so the LAN
+// directory converges fast on the happy path
+// (a fresh peer joins, a new direct connection
+// happens). Errors are logged but not fatal — gossip
+// is best-effort; missing one sync just delays
+// convergence until the next channel opens.
+func sendRosterSync(ctx context.Context, ch *protocol.Channel, store *roster.Store) {
+	entries := store.List()
+	wire := protocol.RosterSync{
+		Entries: make([]protocol.RosterEntry, 0, len(entries)),
+	}
+	for _, e := range entries {
+		wire.Entries = append(wire.Entries, protocol.RosterEntry{
+			PeerID:    e.PeerID,
+			Hostname:  e.Hostname,
+			Addrs:     e.Addrs,
+			FirstSeen: e.FirstSeen,
+		})
+	}
+	payload, err := json.Marshal(wire)
+	if err != nil {
+		log.Printf("[ERROR] roster marshal: %v", err)
+		return
+	}
+	if err := ch.Send(ctx, protocol.Envelope{
+		Type:    protocol.TypeRosterSync,
+		Payload: payload,
+	}); err != nil {
+		log.Printf("[ERROR] roster send: %v", err)
+	}
+}
+
+// broadcastRosterToAll fans the local roster out to
+// every active channel except the one we just
+// received from. This is the "push-on-change" half of
+// the gossip protocol: when B tells us about peer
+// C, we now know C, so we tell A (and any other
+// peers) too. Without this, gossip only propagates
+// one hop per channel-ready event; with it, gossip
+// spreads along the chain until every node knows
+// every other node.
+func broadcastRosterToAll(ctx context.Context, reg *channelRegistry, store *roster.Store, exclude []byte) {
+	all := reg.snapshot()
+	for _, st := range all {
+		if bytes.Equal(st.peerID, exclude) {
+			continue
+		}
+		sendRosterSync(ctx, st.ch, store)
+	}
+}
+
 // runStdinLoop reads commands from stdin.
 //
 // Commands:
@@ -558,7 +737,7 @@ func wrapChannel(ctx context.Context, conn *transport.Conn, sess *handshake.Sess
 //   - ping <peer-id-hex>           send a ping
 //   - help                         list commands
 //   - quit                         exit
-func runStdinLoop(ctx context.Context, cancel context.CancelFunc, reg *channelRegistry, chatStore *storage.Store, history *[]*storage.Record, id *identity.Identity, tr *transport.Transport, saveDir string, aliasStore *alias.Store) {
+func runStdinLoop(ctx context.Context, cancel context.CancelFunc, reg *channelRegistry, chatStore *storage.Store, history *[]*storage.Record, id *identity.Identity, tr *transport.Transport, saveDir string, aliasStore *alias.Store, rosterStore *roster.Store) {
 	scanner := bufio.NewScanner(os.Stdin)
 	printPrompt()
 	for scanner.Scan() {
@@ -651,6 +830,51 @@ func runStdinLoop(ctx context.Context, cancel context.CancelFunc, reg *channelRe
 			}
 		case "peers":
 			showPeers(aliasStore)
+		case "roster":
+			// roster                        -- list every peer
+			//                                in the LAN directory
+			//                                (synced via gossip),
+			//                                with online / offline
+			//                                status per entry.
+			// roster forget <peer-id-or-alias>
+			//                              -- remove an entry
+			//                                locally (we'll forget
+			//                                we ever knew about
+			//                                them; we won't gossip
+			//                                this removal). To
+			//                                permanently wipe from
+			//                                all peers' views,
+			//                                you'd need a removal
+			//                                protocol — v0.5
+			//                                doesn't have one.
+			if len(parts) >= 2 && parts[1] == "forget" {
+				if len(parts) < 3 {
+					log.Println("[USAGE] roster forget <peer-id-or-alias>")
+				} else {
+					pid, err := resolvePeerRef(aliasStore, parts[2])
+					if err != nil {
+						// fall back: try the raw string as a peer id
+						if len(parts[2]) != 32 {
+							log.Printf("[ERROR] roster forget: %v", err)
+						} else {
+							pid = parts[2]
+						}
+					}
+					if pid != "" {
+						if err := rosterStore.Remove(pid); err != nil {
+							log.Printf("[ERROR] roster forget: %v", err)
+						} else {
+							if err := rosterStore.Save(); err != nil {
+								log.Printf("[ERROR] roster save: %v", err)
+							} else {
+								log.Printf("[INFO ] forgot %s from roster", pid)
+							}
+						}
+					}
+				}
+			} else {
+				showRoster(rosterStore, reg, id)
+			}
 		case "dial":
 			// dial <ip:port>  -- bypass UDP discovery and
 			// connect directly to a known peer. Useful in
@@ -666,7 +890,7 @@ func runStdinLoop(ctx context.Context, cancel context.CancelFunc, reg *channelRe
 			if len(parts) < 2 {
 				log.Println("[USAGE] dial <ip:port>")
 			} else {
-				dialAddr(ctx, id, tr, parts[1], reg, saveDir, chatStore, history, aliasStore)
+				dialAddr(ctx, id, tr, parts[1], reg, saveDir, chatStore, history, aliasStore, rosterStore)
 			}
 		case "help":
 			log.Println("[HELP ] send <peer-id-or-alias> <text> -- send a chat message")
@@ -677,6 +901,8 @@ func runStdinLoop(ctx context.Context, cancel context.CancelFunc, reg *channelRe
 			log.Println("[HELP ] alias <name> <peer-id-hex>      -- name a peer")
 			log.Println("[HELP ] unalias <name-or-peer-id>       -- drop an alias")
 			log.Println("[HELP ] peers                            -- list known peers + aliases")
+			log.Println("[HELP ] roster                           -- list LAN peer directory (M5 gossip)")
+			log.Println("[HELP ] roster forget <peer-id-or-alias> -- drop a peer from the local directory")
 			log.Println("[HELP ] dial <ip:port>                   -- connect directly (skip discovery)")
 			log.Println("[HELP ] help                             -- this list")
 			log.Println("[HELP ] quit                             -- exit")
@@ -885,6 +1111,82 @@ func listAliases(aliasStore *alias.Store) {
 // but the user's intent is different. We present
 // `peers` in a "name + last_seen" two-column
 // format because recency is the deciding factor
+// showRoster prints the full M5 LAN peer directory —
+// every peer we've heard about, whether or not we
+// have an active channel to them right now. Each row
+// shows the local presence state (online / offline
+// / self) derived from the channelRegistry, plus the
+// peerID and the address(es) we last heard for them.
+//
+// This is the "内网通/飞秋 user list" view: roster
+// is the static phone book, presence is the live
+// green-dot indicator. They are NOT synced from other
+// nodes — your view of "who's online" is your own.
+func showRoster(rosterStore *roster.Store, reg *channelRegistry, self *identity.Identity) {
+	entries := rosterStore.List()
+	if len(entries) == 0 {
+		log.Printf("[INFO ] roster is empty (waiting for gossip from connected peers)")
+		return
+	}
+	// Sort by peerID for stable output.
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].PeerID < entries[j].PeerID
+	})
+	selfID := self.PeerIDHex()
+	online := 0
+	log.Printf("[ROSTER] %d entries:", len(entries))
+	for _, e := range entries {
+		state := "offline"
+		if e.PeerID == selfID {
+			state = "self   "
+		} else if reg.get([]byte(peerIDFromHex(e.PeerID))) != nil {
+			state = "online "
+			online++
+		}
+		hostname := e.Hostname
+		if hostname == "" {
+			hostname = "(no hostname)"
+		}
+		addrs := "(no addr)"
+		if len(e.Addrs) > 0 {
+			addrs = strings.Join(e.Addrs, ",")
+		}
+		log.Printf("[ROSTER] %s  %-20s  %s  %s",
+			state, truncate(hostname, 20), truncate(addrs, 32), e.PeerID[:8]+"...")
+	}
+	log.Printf("[ROSTER] %d online / %d total", online, len(entries))
+}
+
+// peerIDFromHex is a tiny helper for showRoster —
+// avoids duplicating the 16-byte slice conversion
+// (the same dance that showPeers / peerHex already
+// does elsewhere). Errors fall back to nil, which
+// just means "not in the registry" — the row is
+// marked offline. We don't propagate the error
+// because a malformed roster entry from gossip
+// should not crash the show command.
+func peerIDFromHex(s string) []byte {
+	b, err := hex.DecodeString(s)
+	if err != nil || len(b) != identity.PeerIDSize {
+		return nil
+	}
+	return b
+}
+
+// truncate is the same line-length kludge that
+// showPeers uses. Duplicated here rather than
+// imported because helpers.go is the cmd-layer
+// shared file and this is a one-liner.
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	if n <= 3 {
+		return s[:n]
+	}
+	return s[:n-3] + "..."
+}
+
 // for "is this thing still online?".
 func showPeers(aliasStore *alias.Store) {
 	rows := aliasStore.ListWithNames()
