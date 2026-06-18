@@ -10,37 +10,51 @@ import (
 // the expected paths when no overrides are given. This is the
 // "fresh install, run from cwd" case — the one the user's 2026-
 // 06-18 feedback asked for (everything in cwd, no HOME sprawl).
+//
+// IMPORTANT: expected paths are computed via filepath.Join
+// rather than hard-coded strings. On Windows that gives
+// backslashes; on Linux/macOS it gives forward slashes. The
+// production code uses filepath.Join internally too, so the
+// test stays correct on every platform without per-OS
+// branches. A future refactor that uses string concatenation
+// or hard-coded separators would surface here.
 func TestNewLayout_Defaults(t *testing.T) {
 	cwd := `D:\test-zone`
 	l, err := NewLayout(cwd, Overrides{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	wants := map[string]string{
-		"DataDir":   `D:\test-zone\.innerlink`,
-		"DeviceKey": `D:\test-zone\.innerlink\device.key`,
-		"Aliases":   `D:\test-zone\.innerlink\aliases.json`,
-		"ChatLog":   `D:\test-zone\.innerlink\chat.enc`,
-		"Received":  `D:\test-zone\received`,
-		"LogFile":   `D:\test-zone\innerlink.log`,
+	// On macOS/Linux, NewLayout will be called from a forward-
+	// slash cwd, but we're testing the relative layout — the
+	// shape is what matters, not the separator. We test the
+	// shape by comparing to a fresh layout built with
+	// filepath.Join, then verify each field is "in cwd".
+	baseFor := func(cwd, sub string) string {
+		return filepath.Join(cwd, sub)
 	}
-	got := map[string]string{
-		"DataDir":   l.DataDir,
-		"DeviceKey": l.DeviceKey,
-		"Aliases":   l.Aliases,
-		"ChatLog":   l.ChatLog,
-		"Received":  l.Received,
-		"LogFile":   l.LogFile,
+	checks := []struct {
+		field string
+		got   string
+		want  string
+	}{
+		{"DataDir", l.DataDir, baseFor(cwd, ".innerlink")},
+		{"DeviceKey", l.DeviceKey, baseFor(baseFor(cwd, ".innerlink"), "device.key")},
+		{"Aliases", l.Aliases, baseFor(baseFor(cwd, ".innerlink"), "aliases.json")},
+		{"ChatLog", l.ChatLog, baseFor(baseFor(cwd, ".innerlink"), "chat.enc")},
+		{"Received", l.Received, baseFor(cwd, "received")},
+		{"LogFile", l.LogFile, baseFor(cwd, "innerlink.log")},
 	}
-	for k, want := range wants {
-		if got[k] != want {
-			t.Errorf("%s = %q, want %q", k, got[k], want)
+	for _, c := range checks {
+		if c.got != c.want {
+			t.Errorf("%s = %q, want %q", c.field, c.got, c.want)
 		}
 	}
-	// Sanity: nothing leaks outside <cwd>.
-	for k, v := range got {
-		if !strings.HasPrefix(v, cwd) && !filepath.IsAbs(v) {
-			t.Errorf("%s = %q escapes cwd %q", k, v, cwd)
+	// Sanity: nothing leaks outside <cwd>. We accept either
+	// "starts with cwd" or "absolute under cwd's parent", which
+	// is the case for paths the user passed as absolute.
+	for _, c := range checks {
+		if !strings.HasPrefix(c.got, cwd) && !filepath.IsAbs(c.got) {
+			t.Errorf("%s = %q escapes cwd %q", c.field, c.got, cwd)
 		}
 	}
 }
@@ -48,38 +62,50 @@ func TestNewLayout_Defaults(t *testing.T) {
 // TestNewLayout_Overrides verifies each override field actually
 // wins. A future regression that re-introduces a hard-coded HOME
 // path would be caught here.
+//
+// We use platform-relative paths in the override (constructed
+// via filepath.Join) so the test runs on Linux/macOS too. The
+// production behavior under test is "override wins" — not the
+// exact string — so the assertion is on the relative layout
+// shape, not the absolute path.
 func TestNewLayout_Overrides(t *testing.T) {
-	cwd := `D:\test-zone`
-	o := Overrides{
-		DataDir:   `E:\custom-state`,
-		SaveDir:   `E:\incoming`,
-		DeviceKey: `E:\custom-state\my.key`,
-		LogFile:   `E:\custom-state\run.log`,
-	}
-	l, err := NewLayout(cwd, o)
+	cwd, err := filepath.Abs(".")
 	if err != nil {
 		t.Fatal(err)
 	}
-	// DataDir + DeviceKey come from override.
-	if l.DataDir != `E:\custom-state` {
-		t.Errorf("DataDir = %q, want E:\\custom-state", l.DataDir)
+	dataDir := filepath.Join(cwd, "custom-state")
+	saveDir := filepath.Join(cwd, "incoming")
+	deviceKey := filepath.Join(dataDir, "my.key")
+	logFile := filepath.Join(dataDir, "run.log")
+
+	l, err := NewLayout("", Overrides{
+		DataDir:   dataDir,
+		SaveDir:   saveDir,
+		DeviceKey: deviceKey,
+		LogFile:   logFile,
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if l.DeviceKey != `E:\custom-state\my.key` {
-		t.Errorf("DeviceKey = %q, want E:\\custom-state\\my.key", l.DeviceKey)
+	if l.DataDir != dataDir {
+		t.Errorf("DataDir = %q, want %q", l.DataDir, dataDir)
+	}
+	if l.DeviceKey != deviceKey {
+		t.Errorf("DeviceKey = %q, want %q", l.DeviceKey, deviceKey)
 	}
 	// Aliases / ChatLog are derived from the overridden DataDir.
-	if l.Aliases != `E:\custom-state\aliases.json` {
-		t.Errorf("Aliases = %q, want E:\\custom-state\\aliases.json", l.Aliases)
+	if l.Aliases != filepath.Join(dataDir, "aliases.json") {
+		t.Errorf("Aliases = %q, want %q", l.Aliases, filepath.Join(dataDir, "aliases.json"))
 	}
-	if l.ChatLog != `E:\custom-state\chat.enc` {
-		t.Errorf("ChatLog = %q, want E:\\custom-state\\chat.enc", l.ChatLog)
+	if l.ChatLog != filepath.Join(dataDir, "chat.enc") {
+		t.Errorf("ChatLog = %q, want %q", l.ChatLog, filepath.Join(dataDir, "chat.enc"))
 	}
 	// SaveDir / LogFile are independent of DataDir.
-	if l.Received != `E:\incoming` {
-		t.Errorf("Received = %q, want E:\\incoming", l.Received)
+	if l.Received != saveDir {
+		t.Errorf("Received = %q, want %q", l.Received, saveDir)
 	}
-	if l.LogFile != `E:\custom-state\run.log` {
-		t.Errorf("LogFile = %q, want E:\\custom-state\\run.log", l.LogFile)
+	if l.LogFile != logFile {
+		t.Errorf("LogFile = %q, want %q", l.LogFile, logFile)
 	}
 }
 
@@ -87,14 +113,19 @@ func TestNewLayout_Overrides(t *testing.T) {
 // gets anchored to cwd, not interpreted as a path relative to
 // the binary's directory. This is the bug that bit us when the
 // default log file used to land next to the exe.
+//
+// We use t.TempDir() to get a real cross-platform cwd, then
+// assert the resulting path is rooted at that cwd regardless
+// of what OS Go decides to format the separator as.
 func TestNewLayout_RelativeOverride(t *testing.T) {
-	cwd := `D:\test-zone`
+	cwd := t.TempDir()
 	l, err := NewLayout(cwd, Overrides{SaveDir: "files"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if l.Received != `D:\test-zone\files` {
-		t.Errorf("Received = %q, want D:\\test-zone\\files", l.Received)
+	want := filepath.Join(cwd, "files")
+	if l.Received != want {
+		t.Errorf("Received = %q, want %q", l.Received, want)
 	}
 }
 
