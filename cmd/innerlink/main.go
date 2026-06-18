@@ -507,9 +507,13 @@ func wrapChannel(ctx context.Context, conn *transport.Conn, sess *handshake.Sess
 			case protocol.TypePing:
 				log.Printf("[MSG  ] in  <%s> ping", peerHexStr)
 				aliasStore.Touch(peerHexStr)
-				_ = ch.SendPing(ctx) // pong
+				_ = ch.SendPong(ctx) // reply with Pong, not another Ping
 			case protocol.TypePong:
-				// ignore for v0.1
+				// Receiver of the pong reply. Log it so
+				// the user sees the round-trip, and bump
+				// the alias last-seen timestamp.
+				log.Printf("[MSG  ] in  <%s> pong", peerHexStr)
+				aliasStore.Touch(peerHexStr)
 			default:
 				// File traffic and anything else: let the
 				// file receiver own it. Handle() is also
@@ -571,12 +575,22 @@ func runStdinLoop(ctx context.Context, cancel context.CancelFunc, reg *channelRe
 			// validates). A peer can have at
 			// most one alias; assigning a
 			// second one overwrites the first.
-			if len(parts) < 3 {
-				log.Println("[USAGE] alias <name> <peer-id-hex>")
-				log.Println("        alias    -- list all aliases")
-			} else if parts[1] == "list" {
+			//
+			// Bare `alias` (no args) lists all
+			// aliases. `alias list` is also
+			// accepted as an alias for the
+			// listing command.
+			switch len(parts) {
+			case 1:
 				listAliases(aliasStore)
-			} else {
+			case 2:
+				if parts[1] == "list" {
+					listAliases(aliasStore)
+				} else {
+					log.Println("[USAGE] alias <name> <peer-id-hex>")
+					log.Println("        alias    -- list all aliases")
+				}
+			default:
 				if err := aliasStore.Set(parts[2], parts[1]); err != nil {
 					log.Printf("[ERROR] alias: %v", err)
 				} else {
@@ -636,8 +650,8 @@ func runStdinLoop(ctx context.Context, cancel context.CancelFunc, reg *channelRe
 			log.Println("[HELP ] sendfile <peer-id-or-alias> <path> -- send a file")
 			log.Println("[HELP ] history [peer-id-or-alias]     -- show recent chat (filter by one peer)")
 			log.Println("[HELP ] ping <peer-id-or-alias>         -- send a liveness probe")
+			log.Println("[HELP ] alias                            -- show all aliases")
 			log.Println("[HELP ] alias <name> <peer-id-hex>      -- name a peer")
-			log.Println("[HELP ] alias list                       -- show all aliases")
 			log.Println("[HELP ] unalias <name-or-peer-id>       -- drop an alias")
 			log.Println("[HELP ] peers                            -- list known peers + aliases")
 			log.Println("[HELP ] dial <ip:port>                   -- connect directly (skip discovery)")

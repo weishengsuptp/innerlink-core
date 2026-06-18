@@ -399,6 +399,25 @@ func (n *Node) WaitForLogDesc(pattern *regexp.Regexp, timeout time.Duration, des
 	}
 }
 
+// SnapshotLogs returns a chronological copy of the full log
+// ring buffer. Used by tests that need to scan for the
+// presence/absence of patterns (e.g. regression guards that
+// count "shouldn't have happened" lines).
+func (n *Node) SnapshotLogs() []string {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	out := make([]string, 0, n.logsCap)
+	for i := 0; i < n.logsCap; i++ {
+		idx := (n.logsIdx - 1 - i + n.logsCap) % n.logsCap
+		line := n.logs[idx]
+		if line == "" {
+			continue
+		}
+		out = append([]string{line}, out...)
+	}
+	return out
+}
+
 // recentLogs returns the last `n` log lines for the failure
 // message. The ring buffer may contain old lines from a
 // previous test, but since each Node is per-test, that's

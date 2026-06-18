@@ -172,6 +172,14 @@ func (c *Channel) SendPing(ctx context.Context) error {
 	return c.send(ctx, Envelope{Type: TypePing})
 }
 
+// SendPong replies to a received Ping. Callers should only send
+// pong in response to a ping — sending one unsolicited is a
+// protocol violation (the remote will treat it as a ping and
+// pong back, causing a ping-pong loop).
+func (c *Channel) SendPong(ctx context.Context) error {
+	return c.send(ctx, Envelope{Type: TypePong})
+}
+
 // Send transmits a fully-formed Envelope. The Channel fills in
 // Version, From, TS, and MsgID if the caller leaves them zero.
 // Type and Payload must be set.

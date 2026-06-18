@@ -410,6 +410,62 @@ func TestE2E_M4_PeersList(t *testing.T) {
 	a.WaitForLog(regexp.MustCompile(bID), 5*time.Second)
 }
 
+// ---------------------------------------------------------------------------
+// E2E ping/pong round-trip — regression for the "ping echo loop"
+// ---------------------------------------------------------------------------
+
+// TestE2E_PingPongRoundTrip guards against the bug where the
+// receiver of a ping would SendPing() instead of SendPong(),
+// causing both sides to bounce ping envelopes back and forth
+// until the channel was closed. The fix lives in
+// internal/protocol.SendPong and the cmd/innerlink dispatcher.
+//
+// What "success" looks like on A's log:
+//   - one "[MSG  ] out ><B>> ping" line (user-issued)
+//   - one "[MSG  ] in  <B> pong" line (B's reply)
+//   - NO "[MSG  ] in  <B> ping" line (would mean B echoed
+//     back a ping envelope, restarting the loop)
+//
+// We wait a generous window after the pong arrives, then
+// scan A's recent log for any extra ping/pong lines. If
+// the bug regresses, dozens of in-ping lines appear within
+// a few hundred ms.
+func TestE2E_PingPongRoundTrip(t *testing.T) {
+	alloc := NewPortAllocator()
+	a := StartNode(t, alloc, "A")
+	b := StartNode(t, alloc, "B")
+	dialPair(t, a, b)
+
+	bID := b.PeerID()
+	a.Send("ping " + bID)
+	a.WaitForLog(regexp.MustCompile(`\[MSG  \] in  <`+bID+`> pong`), 5*time.Second)
+
+	// Give the loop time to (NOT) manifest. 500 ms is
+	// enough — when the bug was live, 20+ in-ping lines
+	// arrived in <100 ms.
+	time.Sleep(500 * time.Millisecond)
+
+	inPings := countMatching(a.SnapshotLogs(), `\[MSG  \] in  <`+bID+`> ping\b`)
+	if inPings != 0 {
+		t.Fatalf("ping echo loop regressed: A saw %d in-ping lines (expected 0)", inPings)
+	}
+}
+
+// countMatching is a small regex counter for the log
+// snapshot buffer. It is intentionally strict — we use
+// \b to avoid "ping" matching "ping-pong" or future
+// message types that happen to start with "ping".
+func countMatching(lines []string, pattern string) int {
+	re := regexp.MustCompile(pattern)
+	n := 0
+	for _, l := range lines {
+		if re.MatchString(l) {
+			n++
+		}
+	}
+	return n
+}
+
 // startNodeWithArgs is the low-level constructor. It
 // does NOT wait for readiness; both StartNode and
 // StartNodeWithOptions call it and then wait.

@@ -338,6 +338,24 @@ func TestChannelSendPingPong(t *testing.T) {
 	if len(got.Payload) != 0 {
 		t.Errorf("ping payload = %x, want empty", got.Payload)
 	}
+
+	// Reply with Pong and verify the type arrives. This is the
+	// half of the round-trip that was previously missing — the
+	// receiver used to SendPing() instead of SendPong(), which
+	// caused a ping-pong echo loop in production.
+	if err := chB.SendPong(ctx); err != nil {
+		t.Fatal(err)
+	}
+	gotPong, err := chA.Recv(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotPong.Type != TypePong {
+		t.Errorf("type = %s, want %s (would cause ping-pong loop)", gotPong.Type, TypePong)
+	}
+	if len(gotPong.Payload) != 0 {
+		t.Errorf("pong payload = %x, want empty", gotPong.Payload)
+	}
 }
 
 func TestEnvelopeJSONRoundtrip(t *testing.T) {
