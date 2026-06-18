@@ -885,12 +885,22 @@ func runStdinLoop(ctx context.Context, cancel context.CancelFunc, reg *channelRe
 		case "send":
 			if len(parts) < 3 {
 				log.Println("[USAGE] send <peer-id-or-alias> <text>")
+			} else if strings.TrimSpace(parts[1]) == "" {
+				// v0.6.1: empty peer ref is the
+				// most common typo (extra space,
+				// copy-paste mishap). Print a
+				// clear message instead of letting
+				// resolvePeerRef say `unknown peer
+				// ""`.
+				log.Println("[ERROR] send: peer ref is empty (got: send <empty> <text>)")
 			} else {
 				sendTo(reg, parts[1], parts[2], chatStore, history, id, aliasStore)
 			}
 		case "sendfile":
 			if len(parts) < 3 {
 				log.Println("[USAGE] sendfile <peer-id-or-alias> <local-path>")
+			} else if strings.TrimSpace(parts[1]) == "" {
+				log.Println("[ERROR] sendfile: peer ref is empty")
 			} else {
 				sendFile(reg, parts[1], parts[2], aliasStore)
 			}
@@ -899,6 +909,8 @@ func runStdinLoop(ctx context.Context, cancel context.CancelFunc, reg *channelRe
 		case "ping":
 			if len(parts) < 2 {
 				log.Println("[USAGE] ping <peer-id-or-alias>")
+			} else if strings.TrimSpace(parts[1]) == "" {
+				log.Println("[ERROR] ping: peer ref is empty")
 			} else {
 				pingPeer(reg, parts[1], aliasStore)
 			}
