@@ -39,6 +39,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"sort"
@@ -1008,9 +1009,9 @@ func runStdinLoop(ctx context.Context, cancel context.CancelFunc, reg *channelRe
 				showRoster(rosterStore, reg, id)
 			}
 		case "dial":
-			// dial <ip:port>  -- bypass UDP discovery and
-			// connect directly to a known peer. Useful in
-			// two cases:
+			// dial <peer-id-or-alias-or-ip:port>  -- bypass
+			// UDP discovery and connect directly to a
+			// known peer. Useful in two cases:
 			//   1. e2e tests on a single host (loopback
 			//      is not in the broadcast set; see
 			//      internal/discovery.broadcastAddresses).
@@ -1018,15 +1019,24 @@ func runStdinLoop(ctx context.Context, cancel context.CancelFunc, reg *channelRe
 			//      yellow-pages only work on the local
 			//      broadcast domain). Production users
 			//      can `dial 192.168.2.5:4748` to reach
-			// a peer on a different subnet.
+			//      a peer on a different subnet.
+			//
+			// v0.6: also accepts an alias or peer-id.
+			// The ref is resolved via the alias store
+			// (with a roster fallback for peers we
+			// only know via gossip, not yet named) to
+			// find their first registered addr. The
+			// user no longer has to remember IPs.
 			if len(parts) < 2 {
-				log.Println("[USAGE] dial <ip:port>")
+				log.Println("[USAGE] dial <peer-id-or-alias-or-ip:port>")
 			} else {
-				dialAddr(ctx, id, tr, parts[1], reg, saveDir, chatStore, history, aliasStore, rosterStore, autoScan)
-			}
-			if err := runScan(ctx, parts[1], tcpPort, tr,
-					reg, saveDir, chatStore, history, id, aliasStore, rosterStore, autoScan); err != nil {
-				log.Printf("[ERROR] scan: %v", err)
+				target, err := resolveDialTarget(ctx, parts[1], aliasStore, rosterStore, reg)
+				if err != nil {
+					log.Printf("[ERROR] dial: %v", err)
+				} else {
+					log.Printf("[DIAL ] %s -> %s", parts[1], target)
+					dialAddr(ctx, id, tr, target, reg, saveDir, chatStore, history, aliasStore, rosterStore, autoScan)
+				}
 			}
 		case "scan":
 			// scan <cidr>  -- batch-dial every host in
@@ -1240,13 +1250,83 @@ func peerHex(pid []byte) string {
 	return fmt.Sprintf("%x", pid)
 }
 
-// resolvePeerRef maps a user-typed peer reference
-// (either a 32-char hex peer id or a registered
-// alias name) to a canonical 32-char hex peer id.
+// resolveDialTarget maps a v0.6 user-typed dial
+// reference to an "ip:port" string suitable for
+// dialAddr. Accepts three forms:
 //
-// The alias package does the heavy lifting; this
-// wrapper just (1) returns friendly errors so the
-// REPL can print them, and (2) treats a valid
+//  1. Literal "ip:port" — e.g. "dial 192.168.2.5:4748".
+//     Returned unchanged. Detected by the presence
+//     of a colon (host:port syntax) OR by parseable
+//     dotted-quad IP form.
+//
+//  2. Alias name — e.g. "dial alice". Resolved via
+//     aliasStore, then we look the peer up in the
+//     roster to get their first known addr. The
+//     roster is the union of (a) peers we've
+//     directly handshaked and (b) peers gossiped to
+//     us, so an aliased peer with at least one
+//     known address is reachable.
+//
+//  3. 32-char hex peer id — e.g.
+//     "dial a1b2c3d4e5f6...". Same roster lookup
+//     as the alias path, just keyed by the id
+//     directly.
+//
+// Returns an error if the ref is an alias or peer
+// id but no addr is known (peer in the alias store
+// but never seen on the wire).
+func resolveDialTarget(
+	_ context.Context,
+	ref string,
+	aliasStore *alias.Store,
+	rosterStore *roster.Store,
+	reg *channelRegistry,
+) (string, error) {
+	// Form 1: literal ip:port. If it parses as a
+	// "host:port" combo OR as a bare IP, return as-is.
+	if isDialLiteral(ref) {
+		return ref, nil
+	}
+	// Resolve the ref to a peer id (alias or hex).
+	pid, err := resolvePeerRef(aliasStore, ref)
+	if err != nil {
+		// resolvePeerRef already returns a
+		// friendly error like "unknown peer
+		// 'foo'". Pass it through.
+		return "", err
+	}
+	// First try a live channel — if we already
+	// have a connection to this peer, their
+	// RemoteAddr is the freshest source of truth.
+	for _, st := range reg.snapshot() {
+		if peerHex(st.peerID) == pid {
+			if ra := st.ch.RemoteAddr(); ra != "" {
+				return ra, nil
+			}
+		}
+	}
+	// Fall back to the roster's first known addr.
+	entry, err := rosterStore.Get(pid)
+	if err == nil && len(entry.Addrs) > 0 {
+		return entry.Addrs[0], nil
+	}
+	return "", fmt.Errorf("peer %q has no known address (never seen on the wire?)", ref)
+}
+
+// isDialLiteral reports whether ref looks like a
+// literal network address we can pass straight to
+// dialAddr. We accept "ip:port" (host:port) and
+// bare IPs (the latter dialAddr will reject, but
+// the error message is more useful than "unknown
+// peer 1.2.3.4").
+func isDialLiteral(ref string) bool {
+	if strings.Contains(ref, ":") {
+		return true
+	}
+	return net.ParseIP(ref) != nil
+}
+
+// resolvePeerRef maps a user-typed peer reference
 // 32-char hex string as a no-op so power users
 // don't have to register a name just to send a
 // one-off message.
