@@ -275,6 +275,15 @@ func (s *Store) MergeFromGossip(remote []Entry) (newlyAdded []string, err error)
 // Uses atomic write (tmp + rename) so a crash mid-write
 // doesn't corrupt the file. Returns nil if no changes
 // are pending (no-op).
+//
+// The map is COPIED under the read lock, then marshaled
+// outside the lock. The previous version released the
+// read lock before json.MarshalIndent, which then
+// iterated the same map Add() was concurrently writing
+// to — the race detector caught it on macOS arm64
+// (CI run 27732172056). The copy is the canonical
+// fix: we read the whole map atomically, then the
+// rest of Save operates on a private snapshot.
 func (s *Store) Save() error {
 	s.saveMu.Lock()
 	defer s.saveMu.Unlock()
@@ -283,11 +292,18 @@ func (s *Store) Save() error {
 		s.mu.RUnlock()
 		return nil
 	}
-	f := fileFormat{
-		V:     CurrentVersion,
-		Entry: s.m,
+	// Snapshot the map under the read lock. The
+	// copy is a fresh map; mutations to s.m after
+	// this point don't affect our snapshot.
+	snapshot := make(map[string]Entry, len(s.m))
+	for k, v := range s.m {
+		snapshot[k] = v
 	}
 	s.mu.RUnlock()
+	f := fileFormat{
+		V:     CurrentVersion,
+		Entry: snapshot,
+	}
 	data, err := json.MarshalIndent(f, "", "  ")
 	if err != nil {
 		return fmt.Errorf("roster: marshal: %w", err)
