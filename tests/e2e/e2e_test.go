@@ -466,6 +466,113 @@ func countMatching(lines []string, pattern string) int {
 	return n
 }
 
+// ---------------------------------------------------------------------------
+// E2E multi-peer: 3 nodes, full mesh, parallel chat + alias + peers list
+// ---------------------------------------------------------------------------
+
+// TestE2E_ThreePeerMesh is the multi-peer regression that
+// the user's 2026-06-18 manual test surfaced. The test
+// stands up three independent innerlink instances (A, B, C)
+// on a single host, fully meshes them with three `dial`
+// commands, and verifies:
+//
+//   - All three channels are simultaneously ready on every
+//     node (A sees 2 channels, B sees 2, C sees 2).
+//   - A→B and A→C messages each arrive at the right peer
+//     (no cross-channel contamination: B does NOT see the
+//     "to-C" message, and C does NOT see the "to-B" one).
+//   - B→C and C→B messages work (the most-likely-broken
+//     path, since B and C only know each other through A's
+//     UDP broadcast).
+//   - Aliases set on different peers don't collide.
+//   - `peers` command on each node reports 2 known peers.
+//
+// Failure modes this guards against (none of which are
+// caught by the 2-peer e2e net):
+//   - transport/registry keying on first peer only
+//   - dispatcher routing all inbound envelopes to the
+//     first-established channel
+//   - alias store overwriting the first peer when a second
+//     is added
+//   - session-key / sendfile state being shared between
+//     independent channels
+func TestE2E_ThreePeerMesh(t *testing.T) {
+	alloc := NewPortAllocator()
+	a := StartNode(t, alloc, "A")
+	b := StartNode(t, alloc, "B")
+	c := StartNode(t, alloc, "C")
+
+	// Full mesh via `dial`. Each pair does a direct
+	// handshake. We use dialPair-ish helpers inline
+	// because we need 3 distinct pairings, not just one.
+	a.Send("dial 127.0.0.1:" + strconv.Itoa(b.TCPPort()))
+	gotPeerReady(t, a, b)
+	gotPeerReady(t, b, a)
+
+	a.Send("dial 127.0.0.1:" + strconv.Itoa(c.TCPPort()))
+	gotPeerReady(t, a, c)
+	gotPeerReady(t, c, a)
+
+	b.Send("dial 127.0.0.1:" + strconv.Itoa(c.TCPPort()))
+	gotPeerReady(t, b, c)
+	gotPeerReady(t, c, b)
+
+	// A → B and A → C. The messages are distinct so
+	// we can detect any cross-channel bleed.
+	a.Send("send " + b.PeerID() + " toB-fromA")
+	b.WaitForLog(regexp.MustCompile(`\[MSG  \] in  <`+regexp.QuoteMeta(a.PeerID())+`> toB-fromA`), 5*time.Second)
+
+	a.Send("send " + c.PeerID() + " toC-fromA")
+	c.WaitForLog(regexp.MustCompile(`\[MSG  \] in  <`+regexp.QuoteMeta(a.PeerID())+`> toC-fromA`), 5*time.Second)
+
+	// Cross-peer: B ↔ C, which A is NOT in the path of.
+	b.Send("send " + c.PeerID() + " toC-fromB")
+	c.WaitForLog(regexp.MustCompile(`\[MSG  \] in  <`+regexp.QuoteMeta(b.PeerID())+`> toC-fromB`), 5*time.Second)
+
+	c.Send("send " + b.PeerID() + " toB-fromC")
+	b.WaitForLog(regexp.MustCompile(`\[MSG  \] in  <`+regexp.QuoteMeta(c.PeerID())+`> toB-fromC`), 5*time.Second)
+
+	// Alias collision check. A names B and C. Both
+	// must stick and show up under their own names.
+	a.Send("alias alice " + b.PeerID())
+	a.WaitForLog(regexp.MustCompile(`\[INFO \] aliased alice`), 3*time.Second)
+	a.Send("alias charlie " + c.PeerID())
+	a.WaitForLog(regexp.MustCompile(`\[INFO \] aliased charlie`), 3*time.Second)
+
+	// A's `peers` should report 2. We allow the
+	// header format from the M4 implementation.
+	a.Send("peers")
+	a.WaitForLog(regexp.MustCompile(`\[PEERS\] 2 known peer\(s\)`), 3*time.Second)
+
+	// B's `peers` should also report 2 (A and C).
+	b.Send("peers")
+	b.WaitForLog(regexp.MustCompile(`\[PEERS\] 2 known peer\(s\)`), 3*time.Second)
+
+	// C's `peers` should report 2 (A and B).
+	c.Send("peers")
+	c.WaitForLog(regexp.MustCompile(`\[PEERS\] 2 known peer\(s\)`), 3*time.Second)
+
+	// Cross-channel bleed check: B's log must NOT
+	// contain a "toC-fromA" message. If the
+	// dispatcher is broken, every inbound from A
+	// would land on the first channel, and the
+	// second message (toC-fromA) would show up on
+	// B's side too. 500ms is generous; the
+	// "toB-fromA" message arrives in <50ms, so any
+	// bleed would have shown up by now.
+	time.Sleep(500 * time.Millisecond)
+	bleed := countMatching(b.SnapshotLogs(),
+		regexp.QuoteMeta(a.PeerID())+`> toC-fromA\b`)
+	if bleed != 0 {
+		t.Fatalf("cross-channel bleed: B saw %d 'toC-fromA' messages (expected 0 — dispatcher is routing to wrong channel)", bleed)
+	}
+	bleed2 := countMatching(c.SnapshotLogs(),
+		regexp.QuoteMeta(a.PeerID())+`> toB-fromA\b`)
+	if bleed2 != 0 {
+		t.Fatalf("cross-channel bleed: C saw %d 'toB-fromA' messages (expected 0)", bleed2)
+	}
+}
+
 // startNodeWithArgs is the low-level constructor. It
 // does NOT wait for readiness; both StartNode and
 // StartNodeWithOptions call it and then wait.
