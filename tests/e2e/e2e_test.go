@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -476,7 +477,21 @@ func TestE2E_PingPongRoundTrip(t *testing.T) {
 // PortAllocator. We need all three targets on the
 // SAME port so the scanner can probe them in one
 // pass.
+//
+// macOS limitation: macOS only allows binding to
+// 127.0.0.1 on the lo0 interface; binding to
+// 127.0.0.2/.3/.4 returns "can't assign requested
+// address" because those addresses are not assigned
+// to the interface. The `scan` command itself is
+// platform-neutral — we exercise it manually on macOS
+// and via this test on Linux / Windows. (The
+// `scan.go` unit tests in the same package also
+// cover the parsing / filtering logic.)
 func TestE2E_ScanFindsPeers(t *testing.T) {
+	if runtime.GOOS == "darwin" {
+		t.Skip("scan e2e requires binding to multiple 127.0.0.X addresses; " +
+			"macOS lo0 only allows 127.0.0.1")
+	}
 	const (
 		scanPort      = 4748
 		targetUDPPort = 4747
@@ -645,6 +660,19 @@ func TestE2E_ScanFindsPeers(t *testing.T) {
 	// Wait for [SCAN] target log line + OK lines
 	// for all 3 targets. 254 hosts on loopback at
 	// 16 workers / 1.5s per host = 30s worst case.
+	//
+	// Strict assertion: each OK line must be
+	// "[SCAN] 127.0.0.X:4748 <spaces> OK   peerID="
+	// — the IP:port plus a whitespace pad plus
+	// OK. A previous version used a generic
+	// strings.Contains(s, "OK") which was satisfied
+	// by the scanner's own self-OK line on
+	// 127.0.0.5 even when the three real targets
+	// got 0 hits. Pinning IP+port via regex
+	// closes that hole. The pad is variable-width
+	// ("%-22s" format in scan.go) so we use a
+	// regex instead of literal substring match.
+	okRe := regexp.MustCompile(`\[SCAN\]\s+127\.0\.0\.[234]:4748\s+OK\s+peerID=[0-9a-f]{32}`)
 	expectedHosts := []string{"127.0.0.2", "127.0.0.3", "127.0.0.4"}
 	deadline := time.Now().Add(45 * time.Second)
 	allFound := false
@@ -657,10 +685,9 @@ func TestE2E_ScanFindsPeers(t *testing.T) {
 		s := string(data)
 		found := 0
 		for _, h := range expectedHosts {
-			// We grep for "OK   peerID=" AFTER
-			// the host's IP — that's how the
-			// log line is formatted.
-			if strings.Contains(s, h+":") && strings.Contains(s, "OK") {
+			lineRe := regexp.MustCompile(`\[SCAN\]\s+` +
+				regexp.QuoteMeta(h) + `:4748\s+OK\s+peerID=[0-9a-f]{32}`)
+			if lineRe.MatchString(s) {
 				found++
 			}
 		}
@@ -669,6 +696,7 @@ func TestE2E_ScanFindsPeers(t *testing.T) {
 		} else {
 			time.Sleep(200 * time.Millisecond)
 		}
+		_ = okRe // keep both regexes referenced
 	}
 	if !allFound {
 		data, _ := os.ReadFile(scanLog)
