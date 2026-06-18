@@ -1,6 +1,6 @@
 # innerlink-core 产品需求（PRD）
 
-> 版本：v0.4（2026-06-17）
+> 版本：v0.5（2026-06-18）
 > 状态：M1 / M2 / M3 / M4 已完成，M5 规划中
 > 阅读对象：项目协作者、AI 智能体（Mavis）、测试者
 
@@ -48,7 +48,7 @@
 
 ### M3 — 加密本地存储 ✅（v0.3，2026-06-17）
 
-`internal/storage/` 完成：SM4-CBC + 设备密钥派生，加密落盘 `chat.enc`（默认 `~/Downloads/innerlink/chat.enc`）。cmd REPL 新增 `history` 命令（无参显示最近 50 条；带 peer-id-hex 参数则过滤该 peer）。
+`internal/storage/` 完成：SM4-CBC + 设备密钥派生，加密落盘 `chat.enc`（v0.5+ 默认 `<cwd>/.innerlink/chat.enc`）。cmd REPL 新增 `history` 命令（无参显示最近 50 条；带 peer-id-hex 参数则过滤该 peer）。
 
 **设计原则（落地版）**：
 
@@ -67,6 +67,35 @@
 - 跟 M2 的 `.incoming/` 目录共存，互不干扰
 
 **测试**：`internal/storage/storage_test.go` 14 个测试全过（wrong-key、并发、Unicode、64 KiB 大 body、version 校验等）。
+
+## 5.1 v0.5 — 统一 cwd 落盘布局 ✅（2026-06-18）
+
+用户反馈 v0.1-v0.4 把状态文件散落在 `~/.innerlink/`、`~/Downloads/innerlink/`、exe 同目录等多个位置，测试和清理都不方便。v0.5 引入 `internal/paths` 包做单一配置源，所有路径都从 `cwd` 派生：
+
+```
+<启动时的当前目录>/
+├── .innerlink/         ← 内部状态（隐藏目录）
+│   ├── device.key      ← SM2 私钥（40 字节二进制）
+│   ├── aliases.json    ← M4 别名表
+│   └── chat.enc        ← M3 加密聊天记录
+├── received/           ← 收到的文件（M2）
+└── innerlink.log       ← 运行日志
+```
+
+**好处**：
+- 整个 innerlink 状态可以装在一个文件夹里：复制 = 备份，`rm -rf <test-dir>` = 完全卸载
+- 不污染 `~/Downloads`、`~/.config` 等用户全局目录
+- 多开测试零串扰：每个测试 `t.TempDir()` 跑一份独立 instance
+
+**灵活 override**（v0.5+ CLI flag）：
+- `-data-dir <path>` 改 `.innerlink/` 位置
+- `-save-dir <path>` 改 `received/` 位置
+- `-device-key <path>` 单独指定密钥文件
+- `-log-file <path>` 单独指定日志文件
+
+**未来扩展点**（不破坏 API）：
+- 读 YAML/JSON config 文件：在 `paths.Overrides` 加 `LoadFile(path) error` 即可
+- 走 XDG / AppData：在 `paths.NewLayout` 里加平台检测分支，单点改
 
 **v0.1 明确不做的**（PRD 出 v0.3 后才提的、避免 scope creep）：
 

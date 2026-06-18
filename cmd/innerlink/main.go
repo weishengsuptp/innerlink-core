@@ -38,7 +38,6 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -49,6 +48,7 @@ import (
 	"github.com/weishengsuptp/innerlink-core/internal/handshake"
 	"github.com/weishengsuptp/innerlink-core/internal/identity"
 	"github.com/weishengsuptp/innerlink-core/internal/logx"
+	"github.com/weishengsuptp/innerlink-core/internal/paths"
 	"github.com/weishengsuptp/innerlink-core/internal/protocol"
 	"github.com/weishengsuptp/innerlink-core/internal/storage"
 	"github.com/weishengsuptp/innerlink-core/internal/alias"
@@ -62,15 +62,13 @@ func main() {
 }
 
 // defaultLogFile returns the default path of the innerlink
-// log file. It is "innerlink.log" next to the executable so
-// the user can find it on the desktop, and falls back to
-// the current working directory when the executable path
-// cannot be resolved (which happens for `go run`-built
-// binaries where os.Executable returns a temp path).
+// log file. As of v0.5 this is just the cwd-relative path
+// (the on-disk layout is owned by internal/paths). We keep
+// this function as a thin shim so the flag default reads
+// naturally: a future "innerlink.log under XDG state dir"
+// change touches one place (paths.NewLayout), not every
+// caller.
 func defaultLogFile() string {
-	if exe, err := os.Executable(); err == nil {
-		return filepath.Join(filepath.Dir(exe), "innerlink.log")
-	}
 	return "innerlink.log"
 }
 
@@ -89,8 +87,9 @@ func run() error {
 			"noisy during multi-GiB transfers.")
 	logFile := flag.String("log-file", defaultLogFile(),
 		"path of the log file (in addition to stderr). "+
-			"Use \"\" to disable file output. The file is "+
-			"appended, so successive runs share the same log.")
+			"Empty disables file output. The default is "+
+			"<cwd>/innerlink.log. The file is appended, so "+
+			"successive runs share the same log.")
 	udpPort := flag.Uint("udp-port", uint(discovery.DefaultPort),
 		"UDP port for peer discovery. Default matches the "+
 			"default discovery port. The e2e tests pick a free "+
@@ -100,23 +99,49 @@ func run() error {
 		"TCP port for incoming peer connections. Default "+
 			"matches the default transport port. The e2e "+
 			"tests pick a free port per node.")
+	dataDir := flag.String("data-dir", "",
+		"root directory for innerlink state (device.key, "+
+			"aliases.json, chat.enc). Default: <cwd>/.innerlink. "+
+			"Set this if you want a single shared state dir "+
+			"across multiple invocations from different cwds.")
 	deviceKey := flag.String("device-key", "",
-		"path to the SM2 device key file. Empty (the "+
-			"default) means ~/.innerlink/device.key. The e2e "+
-			"tests use a per-node temp file so two instances "+
-			"have different PeerIDs and can talk to each "+
-			"other without sharing a long-term identity.")
+		"path to the SM2 device key file. Default: "+
+			"<data-dir>/device.key. The e2e tests use a "+
+			"per-node temp file so two instances have "+
+			"different PeerIDs and can talk to each other "+
+			"without sharing a long-term identity.")
 	saveDir := flag.String("save-dir", "",
-		"directory for incoming files and the encrypted "+
-			"chat log (chat.enc). Empty (the default) means "+
-			"~/Downloads/innerlink. The e2e tests use a per-"+
-			"node temp dir so two instances don't share "+
-			"a single chat.enc.")
+		"directory for incoming files. Default: "+
+			"<cwd>/received. The e2e tests use a per-node "+
+			"temp dir so two instances don't share state.")
 	flag.Parse()
+
+	// All on-disk state and runtime files are described by a
+	// single Layout. The flags above are overrides; everything
+	// not overridden defaults to <cwd>/.innerlink for state and
+	// <cwd>/received for incoming files. The Layout is the only
+	// thing every subsystem needs to know about — no subsystem
+	// should re-resolve its own paths from $HOME or hard-coded
+	// constants.
+	layout, err := paths.NewLayout("", paths.Overrides{
+		DataDir:   *dataDir,
+		DeviceKey: *deviceKey,
+		SaveDir:   *saveDir,
+		LogFile:   *logFile,
+	})
+	if err != nil {
+		return fmt.Errorf("resolve paths: %w", err)
+	}
+	if err := layout.Ensure(); err != nil {
+		return fmt.Errorf("create state dirs: %w", err)
+	}
+	log.Printf("[INFO ] data dir:        %s", layout.DataDir)
+	log.Printf("[INFO ] incoming files:  %s", layout.Received)
+	log.Printf("[INFO ] log file:        %s", layout.LogFile)
 
 	if err := logx.Setup(logx.Options{
 		Level:  logx.Level(*logLevel),
-		File:   *logFile,
+		File:   layout.LogFile,
 		Stderr: true,
 	}); err != nil {
 		return fmt.Errorf("logx setup: %w", err)
@@ -124,11 +149,7 @@ func run() error {
 	defer logx.Close()
 
 	// 1) Device identity.
-	keyPath, err := resolveDeviceKey(*deviceKey)
-	if err != nil {
-		return fmt.Errorf("resolve device key path: %w", err)
-	}
-	id, created, err := identity.LoadOrCreate(keyPath)
+	id, created, err := identity.LoadOrCreate(layout.DeviceKey)
 	if err != nil {
 		return fmt.Errorf("load identity: %w", err)
 	}
@@ -137,7 +158,7 @@ func run() error {
 	} else {
 		log.Printf("[INFO ] device identity loaded  peerID=%s", id.PeerIDHex())
 	}
-	log.Printf("[INFO ] device key file: %s", keyPath)
+	log.Printf("[INFO ] device key file: %s", layout.DeviceKey)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
@@ -166,11 +187,7 @@ func run() error {
 	// Save dir for incoming files AND for the encrypted
 	// chat log (chat.enc). Created on first use by the
 	// Receiver and the Storage layer.
-	resolvedSaveDir, err := resolveSaveDir(*saveDir)
-	if err != nil {
-		return fmt.Errorf("resolve save dir: %w", err)
-	}
-	log.Printf("[INFO ] incoming files save dir: %s", resolvedSaveDir)
+	log.Printf("[INFO ] incoming files save dir: %s", layout.Received)
 
 	// M3: encrypted chat log. The Store derives its SM4
 	// key from id.PrivateKeyD(), so the same device.key
@@ -179,7 +196,15 @@ func run() error {
 	// (wrong key) we treat both as "no history yet" —
 	// the chat log is best-effort, never blocking the
 	// user from chatting.
-	chatStore, err := storage.Open(resolvedSaveDir, id.PrivateKeyD())
+	//
+	// Note: as of v0.5 the chat log lives inside the
+	// data dir (<cwd>/.innerlink/chat.enc) rather than
+	// next to received files. Splitting "internal state"
+	// from "user-facing received files" makes the layout
+	// easier to reason about and the test zone easier to
+	// clean (rm -rf <test-dir>/.innerlink wipes state
+	// without nuking received files).
+	chatStore, err := storage.Open(layout.DataDir, id.PrivateKeyD())
 	if err != nil {
 		return fmt.Errorf("open chat log: %w", err)
 	}
@@ -196,13 +221,11 @@ func run() error {
 	historyPtr := &history
 	log.Printf("[INFO ] chat log: %d records loaded", len(history))
 
-	// M4: peer aliases. Same directory as the
-	// device key (~/.innerlink/aliases.json on
-	// a normal install). First launch creates
-	// the file on the first Save; Open on a
-	// missing file is fine.
-	aliasPath := alias.DefaultPath(keyPath)
-	aliasStore, err := alias.Open(aliasPath)
+	// M4: peer aliases. Lives next to the device key
+	// inside the data dir. First launch creates the
+	// file on the first Save; Open on a missing file
+	// is fine.
+	aliasStore, err := alias.Open(layout.Aliases)
 	if err != nil {
 		return fmt.Errorf("open alias file: %w", err)
 	}
@@ -211,7 +234,7 @@ func run() error {
 			log.Printf("[ERROR] close alias file: %v", err)
 		}
 	}()
-	log.Printf("[INFO ] alias file: %s", aliasPath)
+	log.Printf("[INFO ] alias file: %s", layout.Aliases)
 
 	// 4) + 5) Glue: discovery → dial → handshake → channel.
 	channels := newChannelRegistry()
@@ -227,7 +250,7 @@ func run() error {
 				if !ok {
 					return
 				}
-				go handleInbound(ctx, id, inbound, channels, resolvedSaveDir, chatStore, historyPtr, aliasStore)
+				go handleInbound(ctx, id, inbound, channels, layout.Received, chatStore, historyPtr, aliasStore)
 			}
 		}
 	}()
@@ -239,7 +262,7 @@ func run() error {
 			case discovery.PeerAdded:
 				log.Printf("[PEER ] joined   peer=%s at %s", peerHex(ev.PeerID), ev.Peer.Addr)
 				aliasStore.Touch(peerHex(ev.PeerID))
-				go dialAndHandshake(ctx, id, tr, ev.Peer, channels, resolvedSaveDir, chatStore, historyPtr, aliasStore)
+				go dialAndHandshake(ctx, id, tr, ev.Peer, channels, layout.Received, chatStore, historyPtr, aliasStore)
 			case discovery.PeerRemoved:
 				log.Printf("[PEER ] left     peer=%s", peerHex(ev.PeerID))
 			}
@@ -247,7 +270,7 @@ func run() error {
 	}()
 
 	// Stdin command loop.
-	go runStdinLoop(ctx, cancel, channels, chatStore, historyPtr, id, tr, resolvedSaveDir, aliasStore)
+	go runStdinLoop(ctx, cancel, channels, chatStore, historyPtr, id, tr, layout.Received, aliasStore)
 
 	// Wait for Ctrl+C.
 	<-ctx.Done()

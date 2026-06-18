@@ -91,12 +91,13 @@ func StartNode(t *testing.T, allocator *PortAllocator, name string) *Node {
 		t.Fatalf("e2e: port allocator: %v", err)
 	}
 
-	keyPath := filepath.Join(dir, "device.key")
-	logFile := filepath.Join(dir, "log.log")
+	keyPath := filepath.Join(dir, ".innerlink", "device.key")
+	logFile := filepath.Join(dir, "innerlink.log")
 
 	args := []string{
 		"-udp-port=" + strconv.Itoa(ports.UDP),
 		"-tcp-port=" + strconv.Itoa(ports.TCP),
+		"-data-dir=" + filepath.Join(dir, ".innerlink"),
 		"-device-key=" + keyPath,
 		"-save-dir=" + dir,
 		"-log-file=" + logFile,

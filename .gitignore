@@ -37,6 +37,12 @@ desktop.ini
 go.work
 go.work.sum
 
+# innerlink runtime state directories (created by innerlink.exe
+# when launched from this checkout's cwd; never source-controlled)
+.innerlink/
+received/
+innerlink.log
+
 # HANDOFF 是公司 agent 的旧交接文档，跟新仓 innerlink-core 路径不匹配
 # 不入库。新仓重新写 docs/PRD.md / docs/ARCHITECTURE.md
 HANDOFF/

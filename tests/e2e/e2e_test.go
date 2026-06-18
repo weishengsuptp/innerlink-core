@@ -285,7 +285,7 @@ func TestE2E_M3_StorageRoundTrip(t *testing.T) {
 
 	a2 := StartNodeWithOptions(t, alloc, NodeOptions{
 		PeerID:    aPid,
-		DeviceKey: filepath.Join(aDir, "device.key"),
+		DeviceKey: filepath.Join(aDir, ".innerlink", "device.key"),
 		SaveDir:   aDir,
 	})
 
@@ -364,8 +364,10 @@ func TestE2E_M4_AliasRoundTrip(t *testing.T) {
 	b.WaitForLog(regexp.MustCompile(`\[MSG  \] in  <[0-9a-f]{32}> 你好from别名`), 5*time.Second)
 
 	// The aliases file should now exist on disk
-	// under A's save dir.
-	aliasesPath := filepath.Join(a.Dir(), "aliases.json")
+	// under A's data dir (the new v0.5 layout puts
+	// it at <data-dir>/aliases.json, not directly
+	// in the cwd).
+	aliasesPath := filepath.Join(a.Dir(), ".innerlink", "aliases.json")
 	if _, err := os.Stat(aliasesPath); err != nil {
 		t.Fatalf("e2e: M4: %s should exist after `alias` cmd: %v", aliasesPath, err)
 	}
@@ -579,10 +581,26 @@ func TestE2E_ThreePeerMesh(t *testing.T) {
 func startNodeWithArgs(t *testing.T, ports Pair, deviceKey, saveDir string) *Node {
 	t.Helper()
 	binaryPath := ResolveBinary(t)
-	logFile := filepath.Join(saveDir, "log.log")
+	logFile := filepath.Join(saveDir, "innerlink.log")
+	// The v0.5+ layout puts chat.enc and aliases.json
+	// inside a per-test .innerlink/ subdir. We derive
+	// the data dir from the device-key's parent — this
+	// works as long as callers pass <dir>/.innerlink/
+	// device.key (the StartNode wrapper does; the M3
+	// regression's NodeOptions call also does). If
+	// the device key is at <dir>/device.key (legacy
+	// call), we fall back to <dir>/.innerlink for
+	// the chat log and aliases — they're not
+	// co-located in that case, but the test still
+	// gets per-test isolation.
+	dataDir := filepath.Dir(deviceKey)
+	if filepath.Base(dataDir) != ".innerlink" {
+		dataDir = filepath.Join(filepath.Dir(deviceKey), ".innerlink")
+	}
 	args := []string{
 		"-udp-port=" + strconv.Itoa(ports.UDP),
 		"-tcp-port=" + strconv.Itoa(ports.TCP),
+		"-data-dir=" + dataDir,
 		"-device-key=" + deviceKey,
 		"-save-dir=" + saveDir,
 		"-log-file=" + logFile,
