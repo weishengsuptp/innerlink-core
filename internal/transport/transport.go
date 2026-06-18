@@ -299,6 +299,7 @@ func readFullCtx(r io.Reader, buf []byte, deadline time.Time, ctx context.Contex
 // and the registry of active Conn instances.
 type Transport struct {
 	port      int
+	bindIP    string // local IP to bind TCP listener to (default "0.0.0.0")
 	heartbeat time.Duration
 
 	listener net.Listener
@@ -331,8 +332,25 @@ func NewTransport() *Transport {
 // instances on one machine without collisions; production code
 // should keep using NewTransport + DefaultPort.
 func NewTransportOnPort(port int) *Transport {
+	return NewTransportOnPortBind(port, "0.0.0.0")
+}
+
+// NewTransportOnPortBind is the bind-IP-aware variant
+// of NewTransportOnPort. Pass a routable local IP
+// (e.g. 127.0.0.2 for the second loopback alias) when
+// you need multiple instances on the same port
+// without the "0.0.0.0 already in use" error Windows
+// throws. This mirrors the Announcer's
+// NewAnnouncerOnPortBind API and is what makes the
+// v0.5.1 scan e2e possible (3 targets on the same
+// port, different loopback IPs).
+func NewTransportOnPortBind(port int, bindIP string) *Transport {
+	if bindIP == "" {
+		bindIP = "0.0.0.0"
+	}
 	return &Transport{
 		port:      port,
+		bindIP:    bindIP,
 		heartbeat: DefaultHeartbeat,
 		conns:     make(map[string]*Conn),
 		inbounds:  make(chan *Conn, 8),
@@ -342,9 +360,20 @@ func NewTransportOnPort(port int) *Transport {
 
 // Listen binds the TCP listener. Must be called before Run.
 func (t *Transport) Listen() error {
-	l, err := net.Listen("tcp", fmt.Sprintf(":%d", t.port))
+	addr := fmt.Sprintf(":%d", t.port)
+	if t.bindIP != "" && t.bindIP != "0.0.0.0" {
+		// Bind to a specific IP. Required on Windows
+		// to run multiple innerlink instances on the
+		// same port (e.g. 127.0.0.2:4748 + 127.0.0.3:4748);
+		// without this, the second bind fails with
+		// "Only one usage of each socket address ...
+		// is normally permitted" because 0.0.0.0:4748
+		// already exists.
+		addr = fmt.Sprintf("%s:%d", t.bindIP, t.port)
+	}
+	l, err := net.Listen("tcp", addr)
 	if err != nil {
-		return fmt.Errorf("transport: listen :%d: %w", t.port, err)
+		return fmt.Errorf("transport: listen %s: %w", addr, err)
 	}
 	t.listener = l
 	return nil

@@ -196,6 +196,19 @@ func (c *Channel) Close() error {
 	return c.conn.Close()
 }
 
+// RemoteAddr returns the address of the peer this
+// channel is connected to, in the form "ip:port".
+// Used by the v0.5.1 scan command to skip already-
+// known hosts ("we already have a channel to
+// 192.168.40.5, don't redial it"). Returns the empty
+// string if the underlying conn is gone.
+func (c *Channel) RemoteAddr() string {
+	if c == nil || c.conn == nil {
+		return ""
+	}
+	return c.conn.RemoteAddr().String()
+}
+
 // SendText is the convenience method for sending a chat message.
 func (c *Channel) SendText(ctx context.Context, text string) error {
 	return c.send(ctx, Envelope{

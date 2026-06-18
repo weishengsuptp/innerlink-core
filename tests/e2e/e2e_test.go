@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -451,6 +452,183 @@ func TestE2E_PingPongRoundTrip(t *testing.T) {
 	if inPings != 0 {
 		t.Fatalf("ping echo loop regressed: A saw %d in-ping lines (expected 0)", inPings)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// E2E scan: 3 nodes on different loopback IPs, same port, scan finds all
+// ---------------------------------------------------------------------------
+
+// TestE2E_ScanFindsPeers is the v0.5.1 cross-subnet
+// discovery regression. Three innerlink instances
+// listen on the same TCP port (4748) but on three
+// different loopback addresses (127.0.0.2, .3, .4).
+// UDP broadcast doesn't help them find each other
+// because each binds to a specific alias. A fourth
+// "scanner" instance on 127.0.0.5 then runs
+// `scan 127.0.0.0/24` to discover the other three.
+// This mirrors the real production use case: "I just
+// started, I don't know who's around, but I know my
+// subnet, so let me scan it".
+//
+// We do NOT use the standard StartNode helper because
+// the e2e framework assumes "one port per node" via
+// PortAllocator. We need all three targets on the
+// SAME port so the scanner can probe them in one
+// pass.
+func TestE2E_ScanFindsPeers(t *testing.T) {
+	const (
+		scanPort     = 4748
+		targetUDPPort = 4747
+		baseDir      = `D:\mavis-tmp\scan-e2e`
+	)
+
+	// Clean up any leftover state from a prior run.
+	if _, err := os.Stat(baseDir); err == nil {
+		_ = os.RemoveAll(baseDir)
+	}
+	if err := os.MkdirAll(baseDir, 0o755); err != nil {
+		t.Fatalf("e2e: mkdir %s: %v", baseDir, err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(baseDir) })
+
+	// Build the binary via the standard helper.
+	_ = ResolveBinary(t)
+
+	// launch starts one innerlink with the given bind
+	// IP and returns its log file path. It also sets
+	// up cleanup.
+	launch := func(bindIP string, scanSubdir bool) string {
+		dir := filepath.Join(baseDir, bindIP)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("e2e: mkdir %s: %v", dir, err)
+		}
+		logName := "innerlink.log"
+		if scanSubdir {
+			logName = "scanner.log"
+		}
+		logPath := filepath.Join(dir, logName)
+		args := []string{
+			"-udp-port=" + strconv.Itoa(targetUDPPort),
+			"-tcp-port=" + strconv.Itoa(scanPort),
+			"-bind=" + bindIP,
+			"-data-dir=" + filepath.Join(dir, ".innerlink"),
+			"-device-key=" + filepath.Join(dir, "device.key"),
+			"-save-dir=" + filepath.Join(dir, "received"),
+			"-log-file=" + logPath,
+			"-log-level=info",
+		}
+		cmd := exec.Command(ResolveBinary(t), args...)
+		stderrFile, _ := os.Create(filepath.Join(dir, "stderr.log"))
+		cmd.Stderr = stderrFile
+		cmd.Stdout = io.Discard
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("e2e: start %s: %v", bindIP, err)
+		}
+		t.Cleanup(func() { _ = cmd.Process.Kill() })
+		return logPath
+	}
+
+	// Start 3 targets on .2/.3/.4.
+	t2 := launch("127.0.0.2", false)
+	t3 := launch("127.0.0.3", false)
+	t4 := launch("127.0.0.4", false)
+	for _, lp := range []string{t2, t3, t4} {
+		waitForLogContains(t, lp,
+			fmt.Sprintf("listening for peers on TCP :%d", scanPort), 5*time.Second)
+	}
+
+	// Start the scanner on .5 with a stdin pipe so
+	// we can issue `scan` commands. Different ports
+	// from the targets so the scanner doesn't see
+	// its own discovery announcements as targets.
+	scanDir := filepath.Join(baseDir, "127.0.0.5")
+	if err := os.MkdirAll(scanDir, 0o755); err != nil {
+		t.Fatalf("e2e: mkdir %s: %v", scanDir, err)
+	}
+	scanLog := filepath.Join(scanDir, "scanner.log")
+	stdinR, stdinW := io.Pipe()
+	scanCmd := exec.Command(ResolveBinary(t),
+		"-udp-port=49001", "-tcp-port=49002",
+		"-bind=127.0.0.5",
+		"-data-dir="+filepath.Join(scanDir, ".innerlink"),
+		"-device-key="+filepath.Join(scanDir, "device.key"),
+		"-save-dir="+filepath.Join(scanDir, "received"),
+		"-log-file="+scanLog,
+		"-log-level=info",
+	)
+	scanCmd.Stdin = stdinR
+	scanCmd.Stderr = io.Discard
+	scanCmd.Stdout = io.Discard
+	if err := scanCmd.Start(); err != nil {
+		t.Fatalf("e2e: start scanner: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = scanCmd.Process.Kill()
+		_ = stdinW.Close()
+	})
+	waitForLogContains(t, scanLog, "listening for peers on TCP :49002", 5*time.Second)
+
+	// Issue `scan 127.0.0.0/24`. This walks
+	// 127.0.0.1..127.0.0.254. We expect OK for
+	// 127.0.0.2/.3/.4 and refused/timeout for the
+	// rest. 127.0.0.1 (loopback) and 127.0.0.5
+	// (self) are skipped.
+	if _, err := io.WriteString(stdinW, "scan 127.0.0.0/24\n"); err != nil {
+		t.Fatalf("e2e: write scan cmd: %v", err)
+	}
+
+	// Wait for [SCAN] target log line + OK lines
+	// for all 3 targets. 254 hosts on loopback at
+	// 16 workers / 1.5s per host = 30s worst case.
+	expectedHosts := []string{"127.0.0.2", "127.0.0.3", "127.0.0.4"}
+	deadline := time.Now().Add(45 * time.Second)
+	allFound := false
+	for time.Now().Before(deadline) && !allFound {
+		data, err := os.ReadFile(scanLog)
+		if err != nil {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		s := string(data)
+		found := 0
+		for _, h := range expectedHosts {
+			// We grep for "OK   peerID=" AFTER
+			// the host's IP — that's how the
+			// log line is formatted.
+			if strings.Contains(s, h+":") && strings.Contains(s, "OK") {
+				found++
+			}
+		}
+		if found == len(expectedHosts) {
+			allFound = true
+		} else {
+			time.Sleep(200 * time.Millisecond)
+		}
+	}
+	if !allFound {
+		data, _ := os.ReadFile(scanLog)
+		t.Fatalf("e2e: scan did not find all 3 targets within 45s\nlog:\n%s", string(data))
+	}
+}
+
+// waitForLogContains is a tiny helper used by the
+// scan e2e to wait for a process to log a specific
+// line. It's separate from the per-Node WaitForLog
+// because the scan e2e uses raw exec.Cmd instead
+// of the Node wrapper (different ports, different
+// bind IPs).
+func waitForLogContains(t *testing.T, path, needle string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if data, err := os.ReadFile(path); err == nil {
+			if strings.Contains(string(data), needle) {
+				return
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("e2e: %s did not contain %q within %s", path, needle, timeout)
 }
 
 // countMatching is a small regex counter for the log

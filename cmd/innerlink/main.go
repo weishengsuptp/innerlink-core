@@ -183,7 +183,7 @@ func run() error {
 	}()
 
 	// 3) TCP transport.
-	tr := transport.NewTransportOnPort(int(*tcpPort))
+	tr := transport.NewTransportOnPortBind(int(*tcpPort), *bindIP)
 	if err := tr.Listen(); err != nil {
 		return fmt.Errorf("transport listen: %w", err)
 	}
@@ -315,7 +315,7 @@ func run() error {
 	}()
 
 	// Stdin command loop.
-	go runStdinLoop(ctx, cancel, channels, chatStore, historyPtr, id, tr, layout.Received, aliasStore, rosterStore)
+	go runStdinLoop(ctx, cancel, channels, chatStore, historyPtr, id, tr, layout.Received, aliasStore, rosterStore, int(*tcpPort))
 
 	// Wait for Ctrl+C.
 	<-ctx.Done()
@@ -737,7 +737,7 @@ func broadcastRosterToAll(ctx context.Context, reg *channelRegistry, store *rost
 //   - ping <peer-id-hex>           send a ping
 //   - help                         list commands
 //   - quit                         exit
-func runStdinLoop(ctx context.Context, cancel context.CancelFunc, reg *channelRegistry, chatStore *storage.Store, history *[]*storage.Record, id *identity.Identity, tr *transport.Transport, saveDir string, aliasStore *alias.Store, rosterStore *roster.Store) {
+func runStdinLoop(ctx context.Context, cancel context.CancelFunc, reg *channelRegistry, chatStore *storage.Store, history *[]*storage.Record, id *identity.Identity, tr *transport.Transport, saveDir string, aliasStore *alias.Store, rosterStore *roster.Store, tcpPort int) {
 	scanner := bufio.NewScanner(os.Stdin)
 	printPrompt()
 	for scanner.Scan() {
@@ -886,11 +886,38 @@ func runStdinLoop(ctx context.Context, cancel context.CancelFunc, reg *channelRe
 			//      yellow-pages only work on the local
 			//      broadcast domain). Production users
 			//      can `dial 192.168.2.5:4748` to reach
-			//      a peer on a different subnet.
+			// a peer on a different subnet.
 			if len(parts) < 2 {
 				log.Println("[USAGE] dial <ip:port>")
 			} else {
 				dialAddr(ctx, id, tr, parts[1], reg, saveDir, chatStore, history, aliasStore, rosterStore)
+			}
+		case "scan":
+			// scan <cidr>  -- batch-dial every host in
+			// the given IPv4 CIDR, attempting an
+			// innerlink handshake. The hit hosts become
+			// channels (M5 gossip pushes them to other
+			// peers). This is the cross-VLAN /
+			// cross-subnet discovery path: UDP broadcast
+			// only reaches one L2 broadcast domain,
+			// while scan can probe any routable subnet.
+			//
+			// Constraints:
+			//   - IPv4 only
+			//   - max 1024 hosts (rejects /22+)
+			//   - 16 concurrent TCP dials, 1.5s per-host
+			//     timeout
+			//   - skips self and already-connected peers
+			//   - target port is the local node's TCP
+			//     port (the user can `innerlink -tcp-port`
+			//     override before scanning)
+			if len(parts) < 2 {
+				log.Println("[USAGE] scan <ipv4-cidr>  (e.g. scan 192.168.40.0/24)")
+			} else {
+				if err := runScan(ctx, parts[1], tcpPort, tr,
+					reg, saveDir, chatStore, history, id, aliasStore, rosterStore); err != nil {
+					log.Printf("[ERROR] scan: %v", err)
+				}
 			}
 		case "help":
 			log.Println("[HELP ] send <peer-id-or-alias> <text> -- send a chat message")
@@ -904,6 +931,7 @@ func runStdinLoop(ctx context.Context, cancel context.CancelFunc, reg *channelRe
 			log.Println("[HELP ] roster                           -- list LAN peer directory (M5 gossip)")
 			log.Println("[HELP ] roster forget <peer-id-or-alias> -- drop a peer from the local directory")
 			log.Println("[HELP ] dial <ip:port>                   -- connect directly (skip discovery)")
+			log.Println("[HELP ] scan <ipv4-cidr>                 -- batch-dial a subnet to find innerlink peers")
 			log.Println("[HELP ] help                             -- this list")
 			log.Println("[HELP ] quit                             -- exit")
 		case "quit", "exit":
