@@ -1,6 +1,7 @@
 package e2e
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
@@ -490,7 +491,13 @@ func TestE2E_ScanFindsPeers(t *testing.T) {
 
 	// launch starts one innerlink with the given bind
 	// IP and returns its log file path. It also sets
-	// up cleanup.
+	// up cleanup. Child stderr is tagged with the
+	// bind IP and written to t.Log so the CI log
+	// shows exactly what each innerlink process did
+	// — critical for debugging cross-platform bind
+	// failures (the on-disk log file in
+	// /var/folders/.../T/ is not accessible to the
+	// test runner after the test ends).
 	launch := func(bindIP string, scanSubdir bool) string {
 		dir := filepath.Join(baseDir, bindIP)
 		if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -512,11 +519,37 @@ func TestE2E_ScanFindsPeers(t *testing.T) {
 			"-log-level=info",
 		}
 		cmd := exec.Command(ResolveBinary(t), args...)
-		cmd.Stderr = io.Discard
+		// Forward the child's stderr to the test's
+		// own log so the CI runner captures it. The
+		// on-disk log file is still used by the
+		// child for log-file output; this just
+		// additionally pipes a copy to t.Log for
+		// remote debugging.
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatalf("e2e: pipe: %v", err)
+		}
+		cmd.Stderr = w
 		cmd.Stdout = io.Discard
+		go func() {
+			scanner := bufio.NewScanner(r)
+			scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+			for scanner.Scan() {
+				t.Logf("[%s] %s", bindIP, scanner.Text())
+			}
+		}()
 		if err := cmd.Start(); err != nil {
 			t.Fatalf("e2e: start %s: %v", bindIP, err)
 		}
+		// Close the write end in the test goroutine
+		// (not the t.Cleanup), so the scanner goroutine
+		// finishes before t.TempDir cleanup. Otherwise
+		// the pipe write end stays open across cleanup
+		// and the scanner goroutine reads EOF late.
+		go func() {
+			_ = cmd.Wait()
+			_ = w.Close()
+		}()
 		// Register cleanup that kills the process
 		// AND waits for it to actually exit, so the
 		// log file handle is released before
@@ -551,7 +584,19 @@ func TestE2E_ScanFindsPeers(t *testing.T) {
 	scanLog := filepath.Join(scanDir, "scanner.log")
 	stdinR, stdinW := io.Pipe()
 	scanCmd := exec.Command(ResolveBinary(t),
-		"-udp-port=49001", "-tcp-port=49002",
+		"-udp-port=49001",
+		// Same TCP port as the targets. The scan
+		// REPL command dials each host on the
+		// scan-invoking instance's listen port
+		// (assuming all innerlink instances use
+		// the same port, the default 4748). If the
+		// scanner is on a different port, scan
+		// would dial the wrong port and never
+		// find anyone. UDP port stays different
+		// to keep discovery announcements from
+		// the scanner and the targets on separate
+		// broadcast channels.
+		"-tcp-port=4748",
 		"-bind=127.0.0.5",
 		"-data-dir="+filepath.Join(scanDir, ".innerlink"),
 		"-device-key="+filepath.Join(scanDir, "device.key"),
@@ -560,16 +605,33 @@ func TestE2E_ScanFindsPeers(t *testing.T) {
 		"-log-level=info",
 	)
 	scanCmd.Stdin = stdinR
-	scanCmd.Stderr = io.Discard
+	// Pipe scanner stderr to t.Log as well (see
+	// `launch` helper above).
+	r2, w2, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("e2e: scanner pipe: %v", err)
+	}
+	scanCmd.Stderr = w2
 	scanCmd.Stdout = io.Discard
+	go func() {
+		scanner := bufio.NewScanner(r2)
+		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		for scanner.Scan() {
+			t.Logf("[scan] %s", scanner.Text())
+		}
+	}()
 	if err := scanCmd.Start(); err != nil {
 		t.Fatalf("e2e: start scanner: %v", err)
 	}
+	go func() {
+		_ = scanCmd.Wait()
+		_ = w2.Close()
+	}()
 	t.Cleanup(func() {
 		_ = scanCmd.Process.Kill()
 		_ = stdinW.Close()
 	})
-	waitForLogContains(t, scanLog, "listening for peers on TCP :49002", 5*time.Second)
+	waitForLogContains(t, scanLog, "listening for peers on TCP :4748", 5*time.Second)
 
 	// Issue `scan 127.0.0.0/24`. This walks
 	// 127.0.0.1..127.0.0.254. We expect OK for
