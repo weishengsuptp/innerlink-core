@@ -266,3 +266,18 @@ the old key, derive a new key (e.g. KDF of new
 passphrase + old D), encrypt+rewrite the entire
 file. There is no in-place re-key for CBC.
 
+## VM NAT mode auto-discovers via UDP; scan is for cross-VLAN (踩过的坑)
+
+User note (2026-06-18): VMware's default NAT mode puts
+guest VMs on the same virtual subnet as the host's
+vmic interface (e.g. host vmic=192.168.40.1,
+VM1=192.168.40.129, VM2=192.168.40.128). UDP broadcast
+from the discovery announcer therefore reaches the
+other VMs directly — no `scan` needed. The
+`scan <cidr>` command is the fallback for the real
+cross-VLAN / cross-subnet case (e.g. 192.168.40.x vs
+192.168.153.x, or two physical sites bridged through
+a router). v0.5.1 e2e test exercises scan in the
+loopback case; manual test in a real cross-VLAN
+environment is a TODO.
+
