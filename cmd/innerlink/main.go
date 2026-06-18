@@ -125,6 +125,12 @@ func run() error {
 			"192.168.40.5 for a single-NIC LAN host) so "+
 			"the v0.5 roster publishes a routable address "+
 			"instead of 0.0.0.0, which is not dialable.")
+	autoScanFlag := flag.Bool("auto-scan", false,
+		"v0.5.2: when the M5 roster learns about a peer "+
+			"from a /24 we don't have a connection to, "+
+			"auto-trigger a one-shot scan of that /24. "+
+			"Default OFF. Manual `scan <cidr>` is always "+
+			"available regardless of this flag.")
 	flag.Parse()
 
 	// All on-disk state and runtime files are described by a
@@ -285,6 +291,15 @@ func run() error {
 	channels := newChannelRegistry()
 	defer channels.closeAll()
 
+	// v0.5.2: auto-scan state. Created unconditionally
+	// (even when -auto-scan is off) so the REPL can
+	// always show status, but the loop is only started
+	// when the flag is on. myIPs is the local set of
+	// IPs we should consider "self" when deciding
+	// whether a peer's /24 is a different subnet.
+	myIPs := []string{ann.LocalAddr()}
+	autoScan := newAutoScanState(myIPs)
+
 	// Dispatch incoming TCP connections to the handshake+channel setup.
 	go func() {
 		for {
@@ -295,7 +310,7 @@ func run() error {
 				if !ok {
 					return
 				}
-				go handleInbound(ctx, id, inbound, channels, layout.Received, chatStore, historyPtr, aliasStore, rosterStore)
+				go handleInbound(ctx, id, inbound, channels, layout.Received, chatStore, historyPtr, aliasStore, rosterStore, autoScan)
 			}
 		}
 	}()
@@ -307,15 +322,36 @@ func run() error {
 			case discovery.PeerAdded:
 				log.Printf("[PEER ] joined   peer=%s at %s", peerHex(ev.PeerID), ev.Peer.Addr)
 				aliasStore.Touch(peerHex(ev.PeerID))
-				go dialAndHandshake(ctx, id, tr, ev.Peer, channels, layout.Received, chatStore, historyPtr, aliasStore, rosterStore)
+				go dialAndHandshake(ctx, id, tr, ev.Peer, channels, layout.Received, chatStore, historyPtr, aliasStore, rosterStore, autoScan)
 			case discovery.PeerRemoved:
 				log.Printf("[PEER ] left     peer=%s", peerHex(ev.PeerID))
 			}
 		}
 	}()
 
+	// v0.5.2: auto-scan loop. Opt-in via -auto-scan.
+	// The loop consumes subnets from the queue and
+	// runs runScan() against each. After each scan
+	// (success or err) we mark the subnet as known
+	// so a future roster update doesn't re-enqueue.
+	if *autoScanFlag {
+		log.Printf("[INFO ] auto-scan: ENABLED (will probe new /24s as roster learns of them)")
+		go autoScanLoop(ctx, autoScan.queue,
+			func(ctx context.Context, cidr string) error {
+				return runScan(ctx, cidr, int(*tcpPort), tr,
+					channels, layout.Received, chatStore, historyPtr,
+					id, aliasStore, rosterStore, autoScan)
+			},
+			func(cidr string, err error) {
+				autoScan.MarkScanned(cidr)
+			},
+		)
+	} else {
+		log.Printf("[INFO ] auto-scan: disabled (use -auto-scan=true to enable)")
+	}
+
 	// Stdin command loop.
-	go runStdinLoop(ctx, cancel, channels, chatStore, historyPtr, id, tr, layout.Received, aliasStore, rosterStore, int(*tcpPort))
+	go runStdinLoop(ctx, cancel, channels, chatStore, historyPtr, id, tr, layout.Received, aliasStore, rosterStore, int(*tcpPort), autoScan)
 
 	// Wait for Ctrl+C.
 	<-ctx.Done()
@@ -420,7 +456,7 @@ func (r *channelRegistry) closeAll() {
 // check is done here rather than at the call site so that races
 // between two simultaneous dialAndHandshake goroutines for the
 // same peer also collapse to a single connection.
-func dialAndHandshake(ctx context.Context, id *identity.Identity, tr *transport.Transport, p *discovery.Peer, reg *channelRegistry, saveDir string, chatStore *storage.Store, history *[]*storage.Record, aliasStore *alias.Store, rosterStore *roster.Store) {
+func dialAndHandshake(ctx context.Context, id *identity.Identity, tr *transport.Transport, p *discovery.Peer, reg *channelRegistry, saveDir string, chatStore *storage.Store, history *[]*storage.Record, aliasStore *alias.Store, rosterStore *roster.Store, autoScan *autoScanState) {
 	if p.Addr == nil {
 		return
 	}
@@ -451,12 +487,12 @@ func dialAndHandshake(ctx context.Context, id *identity.Identity, tr *transport.
 		return
 	}
 	log.Printf("[HANDS] ok       peer=%s (initiator)", peerHex(p.PeerID))
-	wrapChannel(ctx, conn, sess, reg, saveDir, chatStore, history, id, aliasStore, rosterStore)
+	wrapChannel(ctx, conn, sess, reg, saveDir, chatStore, history, id, aliasStore, rosterStore, autoScan)
 }
 
 // handleInbound is the responder counterpart: another peer
 // dialed us, ran the handshake; we accept and wrap.
-func handleInbound(ctx context.Context, id *identity.Identity, conn *transport.Conn, reg *channelRegistry, saveDir string, chatStore *storage.Store, history *[]*storage.Record, aliasStore *alias.Store, rosterStore *roster.Store) {
+func handleInbound(ctx context.Context, id *identity.Identity, conn *transport.Conn, reg *channelRegistry, saveDir string, chatStore *storage.Store, history *[]*storage.Record, aliasStore *alias.Store, rosterStore *roster.Store, autoScan *autoScanState) {
 	hctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	sess, err := handshake.RunAsResponder(hctx, id, conn)
@@ -465,7 +501,7 @@ func handleInbound(ctx context.Context, id *identity.Identity, conn *transport.C
 		return
 	}
 	log.Printf("[HANDS] ok       peer=%s (responder)", peerHex(sess.RemotePeerID))
-	wrapChannel(ctx, conn, sess, reg, saveDir, chatStore, history, id, aliasStore, rosterStore)
+	wrapChannel(ctx, conn, sess, reg, saveDir, chatStore, history, id, aliasStore, rosterStore, autoScan)
 }
 
 // dialAddr is the manual-connect counterpart to
@@ -482,7 +518,7 @@ func handleInbound(ctx context.Context, id *identity.Identity, conn *transport.C
 // the connection. It's also a useful escape hatch
 // for cross-subnet peers, where the broadcast
 // yellow pages can't reach.
-func dialAddr(ctx context.Context, id *identity.Identity, tr *transport.Transport, addr string, reg *channelRegistry, saveDir string, chatStore *storage.Store, history *[]*storage.Record, aliasStore *alias.Store, rosterStore *roster.Store) {
+func dialAddr(ctx context.Context, id *identity.Identity, tr *transport.Transport, addr string, reg *channelRegistry, saveDir string, chatStore *storage.Store, history *[]*storage.Record, aliasStore *alias.Store, rosterStore *roster.Store, autoScan *autoScanState) {
 	go func() {
 		dctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
@@ -504,7 +540,7 @@ func dialAddr(ctx context.Context, id *identity.Identity, tr *transport.Transpor
 			return
 		}
 		log.Printf("[HANDS] ok       peer=%s (initiator) addr=%s", peerHex(sess.RemotePeerID), addr)
-		wrapChannel(ctx, conn, sess, reg, saveDir, chatStore, history, id, aliasStore, rosterStore)
+		wrapChannel(ctx, conn, sess, reg, saveDir, chatStore, history, id, aliasStore, rosterStore, autoScan)
 	}()
 }
 
@@ -516,7 +552,7 @@ func dialAddr(ctx context.Context, id *identity.Identity, tr *transport.Transpor
 //
 // saveDir is where completed incoming files land. If empty,
 // defaults to <home>/Downloads/innerlink.
-func wrapChannel(ctx context.Context, conn *transport.Conn, sess *handshake.Session, reg *channelRegistry, saveDir string, chatStore *storage.Store, history *[]*storage.Record, id *identity.Identity, aliasStore *alias.Store, rosterStore *roster.Store) {
+func wrapChannel(ctx context.Context, conn *transport.Conn, sess *handshake.Session, reg *channelRegistry, saveDir string, chatStore *storage.Store, history *[]*storage.Record, id *identity.Identity, aliasStore *alias.Store, rosterStore *roster.Store, autoScan *autoScanState) {
 	// M4: bump last_seen on every channel open. The
 	// discovery layer also Touches on PeerAdded, so
 	// a peer that announces but never connects still
@@ -539,6 +575,14 @@ func wrapChannel(ctx context.Context, conn *transport.Conn, sess *handshake.Sess
 		log.Printf("[ERROR] new channel: %v", err)
 		_ = conn.Close()
 		return
+	}
+	// v0.5.2: this channel is now in our registry, so
+	// its peer's /24 is "known" and we should not
+	// auto-scan it. (Mark here, before the pump
+	// starts, so an immediate roster sync doesn't
+	// double-enqueue.)
+	if autoScan != nil {
+		autoScan.MarkConnectedSubnet(ch.RemoteAddr())
 	}
 	// Single-pump dispatch loop. Channel.Recv is NOT safe to
 	// call from multiple goroutines on the same Channel, so we
@@ -660,6 +704,19 @@ func wrapChannel(ctx context.Context, conn *transport.Conn, sess *handshake.Sess
 					// propagates one hop per
 					// channel-ready event.
 					broadcastRosterToAll(ctx, reg, rosterStore, sess.RemotePeerID)
+					// v0.5.2: each newly-learned
+					// peer might be on a /24 we
+					// haven't seen. Enqueue scans
+					// for any such /24s (the
+					// queue + state dedup).
+					if autoScan != nil {
+						for _, peerID := range added {
+							entry, err := rosterStore.Get(peerID)
+							if err == nil {
+								autoScan.EnqueueIfNew(entry.Addrs)
+							}
+						}
+					}
 				} else {
 					log.Printf("[ROSTER] sync from %s: 0 new (already known)", peerHexStr)
 				}
@@ -737,7 +794,7 @@ func broadcastRosterToAll(ctx context.Context, reg *channelRegistry, store *rost
 //   - ping <peer-id-hex>           send a ping
 //   - help                         list commands
 //   - quit                         exit
-func runStdinLoop(ctx context.Context, cancel context.CancelFunc, reg *channelRegistry, chatStore *storage.Store, history *[]*storage.Record, id *identity.Identity, tr *transport.Transport, saveDir string, aliasStore *alias.Store, rosterStore *roster.Store, tcpPort int) {
+func runStdinLoop(ctx context.Context, cancel context.CancelFunc, reg *channelRegistry, chatStore *storage.Store, history *[]*storage.Record, id *identity.Identity, tr *transport.Transport, saveDir string, aliasStore *alias.Store, rosterStore *roster.Store, tcpPort int, autoScan *autoScanState) {
 	scanner := bufio.NewScanner(os.Stdin)
 	printPrompt()
 	for scanner.Scan() {
@@ -890,7 +947,11 @@ func runStdinLoop(ctx context.Context, cancel context.CancelFunc, reg *channelRe
 			if len(parts) < 2 {
 				log.Println("[USAGE] dial <ip:port>")
 			} else {
-				dialAddr(ctx, id, tr, parts[1], reg, saveDir, chatStore, history, aliasStore, rosterStore)
+				dialAddr(ctx, id, tr, parts[1], reg, saveDir, chatStore, history, aliasStore, rosterStore, autoScan)
+			}
+			if err := runScan(ctx, parts[1], tcpPort, tr,
+					reg, saveDir, chatStore, history, id, aliasStore, rosterStore, autoScan); err != nil {
+				log.Printf("[ERROR] scan: %v", err)
 			}
 		case "scan":
 			// scan <cidr>  -- batch-dial every host in
@@ -915,8 +976,27 @@ func runStdinLoop(ctx context.Context, cancel context.CancelFunc, reg *channelRe
 				log.Println("[USAGE] scan <ipv4-cidr>  (e.g. scan 192.168.40.0/24)")
 			} else {
 				if err := runScan(ctx, parts[1], tcpPort, tr,
-					reg, saveDir, chatStore, history, id, aliasStore, rosterStore); err != nil {
+					reg, saveDir, chatStore, history, id, aliasStore, rosterStore, autoScan); err != nil {
 					log.Printf("[ERROR] scan: %v", err)
+				}
+			}
+		case "autoscan":
+			// v0.5.2: show auto-scan status. No
+			// subcommands yet — `autoscan` just dumps
+			// the queue. A future `autoscan off` /
+			// `autoscan <cidr>` could be added if
+			// users want manual control.
+			pending, seen := autoScan.Queue().Snapshot()
+			log.Printf("[AUTOSCAN] pending: %d   seen this session: %d",
+				len(pending), len(seen))
+			if len(pending) > 0 {
+				for _, c := range pending {
+					log.Printf("  pending: %s", c)
+				}
+			}
+			if len(seen) > 0 {
+				for _, c := range seen {
+					log.Printf("  seen:    %s", c)
 				}
 			}
 		case "help":
@@ -928,6 +1008,11 @@ func runStdinLoop(ctx context.Context, cancel context.CancelFunc, reg *channelRe
 			log.Println("[HELP ] alias <name> <peer-id-hex>      -- name a peer")
 			log.Println("[HELP ] unalias <name-or-peer-id>       -- drop an alias")
 			log.Println("[HELP ] peers                            -- list known peers + aliases")
+			log.Println("[HELP ] roster                           -- list LAN peer directory (M5 gossip)")
+			log.Println("[HELP ] roster forget <peer-id-or-alias> -- drop a peer from the local directory")
+			log.Println("[HELP ] dial <ip:port>                   -- connect directly (skip discovery)")
+			log.Println("[HELP ] scan <ipv4-cidr>                 -- batch-dial a subnet to find innerlink peers")
+			log.Println("[HELP ] autoscan                         -- show v0.5.2 auto-scan queue status")
 			log.Println("[HELP ] roster                           -- list LAN peer directory (M5 gossip)")
 			log.Println("[HELP ] roster forget <peer-id-or-alias> -- drop a peer from the local directory")
 			log.Println("[HELP ] dial <ip:port>                   -- connect directly (skip discovery)")

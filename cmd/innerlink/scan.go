@@ -202,7 +202,7 @@ func runScan(ctx context.Context, cidr string, scanTcpPort int,
 	reg *channelRegistry, saveDir string,
 	chatStore *storage.Store, history *[]*storage.Record,
 	id *identity.Identity, aliasStore *alias.Store,
-	rosterStore *roster.Store,
+	rosterStore *roster.Store, autoScan *autoScanState,
 ) error {
 	ips, err := parseScanCIDR(cidr)
 	if err != nil {
@@ -265,7 +265,7 @@ func runScan(ctx context.Context, cidr string, scanTcpPort int,
 			defer wg.Done()
 			for ip := range jobs {
 				addr := net.JoinHostPort(ip, strconv.Itoa(scanTcpPort))
-				res := scanOne(ctx, tr, addr, id, saveDir, chatStore, history, aliasStore, rosterStore, reg)
+				res := scanOne(ctx, tr, addr, id, saveDir, chatStore, history, aliasStore, rosterStore, reg, autoScan)
 				results <- res
 			}
 		}()
@@ -323,7 +323,7 @@ func scanOne(ctx context.Context, tr *transport.Transport, addr string,
 	id *identity.Identity, saveDir string,
 	chatStore *storage.Store, history *[]*storage.Record,
 	aliasStore *alias.Store, rosterStore *roster.Store,
-	reg *channelRegistry,
+	reg *channelRegistry, autoScan *autoScanState,
 ) scanResult {
 	// Per-host timeout. We use a derived context so
 	// one slow host doesn't blow the whole scan's
@@ -345,7 +345,7 @@ func scanOne(ctx context.Context, tr *transport.Transport, addr string,
 	// the same path dialAddr uses, but we capture
 	// the peerID before launching the Recv pump.
 	pid := hex.EncodeToString(sess.RemotePeerID)
-	wrapChannel(ctx, conn, sess, reg, saveDir, chatStore, history, id, aliasStore, rosterStore)
+	wrapChannel(ctx, conn, sess, reg, saveDir, chatStore, history, id, aliasStore, rosterStore, autoScan)
 	return scanResult{addr: addr, peerID: pid}
 }
 
