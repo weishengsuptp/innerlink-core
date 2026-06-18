@@ -13,6 +13,10 @@ dist/
 coverage.out
 coverage.html
 
+# e2e build output (innerlink.exe + .stale* test artifacts
+# produced by tests/e2e/e2e_test.go:TestMain)
+tests/e2e/bin/
+
 # Frontend (Wails future)
 cmd/innerlink-desktop/frontend/node_modules/
 cmd/innerlink-desktop/frontend/dist/

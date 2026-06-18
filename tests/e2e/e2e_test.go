@@ -477,19 +477,13 @@ func TestE2E_PingPongRoundTrip(t *testing.T) {
 // pass.
 func TestE2E_ScanFindsPeers(t *testing.T) {
 	const (
-		scanPort     = 4748
+		scanPort      = 4748
 		targetUDPPort = 4747
-		baseDir      = `D:\mavis-tmp\scan-e2e`
 	)
-
-	// Clean up any leftover state from a prior run.
-	if _, err := os.Stat(baseDir); err == nil {
-		_ = os.RemoveAll(baseDir)
-	}
-	if err := os.MkdirAll(baseDir, 0o755); err != nil {
-		t.Fatalf("e2e: mkdir %s: %v", baseDir, err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(baseDir) })
+	// Use t.TempDir for cross-platform path
+	// safety. Hardcoding `D:\...` here broke the
+	// macos CI (the path doesn't exist on Linux).
+	baseDir := t.TempDir()
 
 	// Build the binary via the standard helper.
 	_ = ResolveBinary(t)
@@ -518,13 +512,22 @@ func TestE2E_ScanFindsPeers(t *testing.T) {
 			"-log-level=info",
 		}
 		cmd := exec.Command(ResolveBinary(t), args...)
-		stderrFile, _ := os.Create(filepath.Join(dir, "stderr.log"))
-		cmd.Stderr = stderrFile
+		cmd.Stderr = io.Discard
 		cmd.Stdout = io.Discard
 		if err := cmd.Start(); err != nil {
 			t.Fatalf("e2e: start %s: %v", bindIP, err)
 		}
-		t.Cleanup(func() { _ = cmd.Process.Kill() })
+		// Register cleanup that kills the process
+		// AND waits for it to actually exit, so the
+		// log file handle is released before
+		// t.TempDir cleanup tries to remove the
+		// directory. Without Wait(), the test
+		// framework on Windows would race the
+		// cleanup with the still-dying process.
+		t.Cleanup(func() {
+			_ = cmd.Process.Kill()
+			_, _ = cmd.Process.Wait()
+		})
 		return logPath
 	}
 
