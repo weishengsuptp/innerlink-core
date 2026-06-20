@@ -395,6 +395,29 @@ func (n *Node) WaitForLogDesc(pattern *regexp.Regexp, timeout time.Duration, des
 	case <-w.ch:
 		return
 	case <-n.doneCh:
+		// Process exited; check the ring buffer one
+		// last time before declaring failure. The
+		// matching line may have been written just
+		// before exit, after the reader goroutine
+		// stopped pumping acceptLine but before
+		// doneCh closed. Without this re-check,
+		// Windows timing can race us into a false
+		// negative (process startup on Windows is
+		// just slow enough that the line lands
+		// after our waiter registers but before the
+		// reader goroutine schedules).
+		n.mu.Lock()
+		for i := 0; i < n.logsCap; i++ {
+			line := n.logs[i]
+			if line == "" {
+				continue
+			}
+			if pattern.MatchString(line) {
+				n.mu.Unlock()
+				return
+			}
+		}
+		n.mu.Unlock()
 		n.t.Fatalf("e2e: %s: process exited before log %q arrived", n.shortID(), desc)
 	case <-time.After(timeout):
 		n.t.Fatalf("e2e: %s: timed out after %s waiting for log %q\nrecent logs:\n%s",
