@@ -192,9 +192,6 @@ func (n *Node) Start(ctx context.Context) error {
 	}
 	n.ctx, n.cancel = context.WithCancel(ctx)
 
-	log.Printf("[INFO ] listening for peers on UDP :%d", n.opts.UDPPort)
-	log.Printf("[INFO ] listening for peers on TCP :%d", n.opts.TCPPort)
-
 	// Load chat history now (after storage is open).
 	history, err := n.chatStore.ReadAll()
 	if err != nil {
@@ -215,11 +212,23 @@ func (n *Node) Start(ctx context.Context) error {
 		}
 	}()
 
-	// 2) TCP transport.
+	// 2) TCP transport. CRITICAL: bind + Listen BEFORE
+	// printing the "listening for peers on TCP :N" log
+	// line. The e2e tests (and the v0.6 CLI's `dial`
+	// path) gate on that exact log line; if we log
+	// before the bind syscall completes, a fast caller
+	// can dial and hit "connectex: No connection could
+	// be made" before the kernel finishes the bind.
+	// The Windows CI runner is slow enough that this
+	// race fires reliably; local Windows / Linux / macOS
+	// have a 10-100x gap between log flush and bind,
+	// which is why v0.6.x never caught it.
 	n.tr = transport.NewTransportOnPortBind(n.opts.TCPPort, n.opts.BindIP)
 	if err := n.tr.Listen(); err != nil {
 		return fmt.Errorf("transport listen: %w", err)
 	}
+	log.Printf("[INFO ] listening for peers on UDP :%d", n.opts.UDPPort)
+	log.Printf("[INFO ] listening for peers on TCP :%d", n.opts.TCPPort)
 	n.wg.Add(1)
 	go func() {
 		defer n.wg.Done()

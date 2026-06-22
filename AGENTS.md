@@ -319,3 +319,18 @@ environment is a TODO.
   separate `innerlink-mobile` repo (Flutter / RN), not
   split per-OS.
 
+## Start() log-before-bind ordering (踩过的坑, v0.7.1)
+
+The CLI's e2e tests (and the `dial` command) gate on
+the exact log line `[INFO ] listening for peers on
+TCP :N`. If `Start()` prints that line BEFORE calling
+`n.tr.Listen()`, a fast caller (test or human) can
+dial and hit `connectex: No connection could be made`
+on Windows CI runners, because the kernel hasn't
+finished the bind() syscall by the time the log
+flushes. Local Windows / Linux / macOS have a
+~10-100x gap between log flush and bind return, which
+is why the race doesn't fire locally. **Rule:** bind
+the socket first, then log. See `pkg/node/node.go`
+Start() for the corrected order.
+
