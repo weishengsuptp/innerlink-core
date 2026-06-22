@@ -1,4 +1,4 @@
-// Package main: v0.5.2 auto-scan. When the M5 roster
+// Package node: v0.5.2 auto-scan. When the M5 roster
 // picks up a peer from a /24 we don't already have
 // any connection to, schedule a one-shot scan of that
 // /24. The goal: "I'm on 192.168.40.x, a peer tells me
@@ -31,7 +31,7 @@
 //     know that subnet has innerlink and don't need
 //     to scan.
 
-package main
+package node
 
 import (
 	"context"

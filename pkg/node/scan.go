@@ -1,28 +1,30 @@
-// scan implements the v0.5.1 "scan <cidr>" REPL command.
-// It batch-dials a user-specified IPv4 subnet, attempting
-// a handshake against every host:port, and reports which
-// hosts spoke innerlink. The matched hosts become normal
-// channels (so chat / file / roster work the moment scan
-// finishes) and M5 gossip pushes them to the rest of the
+// Package node, scan implementation (moved from
+// cmd/innerlink/scan.go as part of v0.7 public-API refactor).
+//
+// Implements the v0.5.1 "scan <cidr>" operation: batch-dial
+// a user-specified IPv4 subnet, attempting a handshake
+// against every host:port. Matched hosts become normal
+// channels (chat / file / roster work as soon as the scan
+// completes) and M5 gossip pushes them to the rest of the
 // LAN.
 //
 // Why batch-dial rather than broadcast?
 //
-// UDP discovery (the default path) only reaches one
-// L2 broadcast domain — a /24 in the same VLAN, same
-// switch, no router in between. For the cross-VLAN
-// case (e.g. a laptop on the WiFi VLAN talking to
-// servers on the wired VLAN), the only practical way
-// to find peers is to TCP-probe their addresses
-// directly. That's what scan does.
+// UDP discovery (the default path) only reaches one L2
+// broadcast domain — a /24 in the same VLAN, same switch,
+// no router in between. For the cross-VLAN case (e.g. a
+// laptop on the WiFi VLAN talking to servers on the wired
+// VLAN), the only practical way to find peers is to
+// TCP-probe their addresses directly. That's what scan
+// does.
 //
 // All parameters are conservative on purpose: scan is
-// user-initiated, single-CIDR, hard-capped at 1024
-// hosts (rejects /16 and larger), concurrent but
-// polite (16 workers, 1.5s per-host timeout). We do
-// NOT want this to be a foot-gun: a `scan 0.0.0.0/0`
-// would otherwise knock on every IPv4 on earth.
-package main
+// user-initiated, single-CIDR, hard-capped at 1024 hosts
+// (rejects /16 and larger), concurrent but polite (16
+// workers, 1.5s per-host timeout). We do NOT want this
+// to be a foot-gun: a `scan 0.0.0.0/0` would otherwise
+// knock on every IPv4 on earth.
+package node
 
 import (
 	"context"
@@ -37,12 +39,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/weishengsuptp/innerlink-core/internal/alias"
 	"github.com/weishengsuptp/innerlink-core/internal/handshake"
-	"github.com/weishengsuptp/innerlink-core/internal/identity"
-	"github.com/weishengsuptp/innerlink-core/internal/roster"
-	"github.com/weishengsuptp/innerlink-core/internal/storage"
-	"github.com/weishengsuptp/innerlink-core/internal/transport"
 )
 
 // scanMaxHosts caps the number of addresses scan will
@@ -176,34 +173,17 @@ func localIPs() map[string]bool {
 	return out
 }
 
-// runScan is the REPL handler for `scan <cidr>`. It
-// parses the CIDR, filters out self + already-connected
-// peers, then dials the rest with bounded concurrency.
-// Successful handshakes become channels (via the same
-// wrapChannel path single-dial uses); failures are
+// Scan is the public entry for "scan <cidr>". It parses
+// the CIDR, filters out self + already-connected peers,
+// then dials the rest with bounded concurrency.
+// Successful handshakes become channels; failures are
 // silent in the registry but logged per-host so the
-// user can see what happened.
+// caller can see what happened.
 //
-// scanTcpPort is the local TCP port the innerlink
-// instance is listening on; other innerlink instances
-// are presumed to be on the same port (the default
-// 4748). The e2e test pins all nodes to a single
-// port, and production users typically don't change
-// the default, so this is the right default. A future
-// `-scan-port` flag could let the user override.
-//
-// The function returns when the scan finishes (or
-// context is canceled). REPL is single-threaded, so
-// the user is blocked from typing during the scan —
-// that is intentional: we don't want interleaved
-// `send` racing with a half-finished scan.
-func runScan(ctx context.Context, cidr string, scanTcpPort int,
-	tr *transport.Transport,
-	reg *channelRegistry, saveDir string,
-	chatStore *storage.Store, history *[]*storage.Record,
-	id *identity.Identity, aliasStore *alias.Store,
-	rosterStore *roster.Store, autoScan *autoScanState,
-) error {
+// Blocks for the duration of the scan (or until ctx is
+// canceled). UI callers wanting non-blocking scans
+// should call this in a goroutine.
+func (n *Node) Scan(ctx context.Context, cidr string) error {
 	ips, err := parseScanCIDR(cidr)
 	if err != nil {
 		return err
@@ -224,7 +204,7 @@ func runScan(ctx context.Context, cidr string, scanTcpPort int,
 		// nodes, but if it ever isn't, this should
 		// still skip on full match).
 		skip := false
-		for _, st := range reg.snapshot() {
+		for _, st := range n.channels.snapshot() {
 			ra := st.ch.RemoteAddr()
 			if ra == "" {
 				continue
@@ -264,8 +244,8 @@ func runScan(ctx context.Context, cidr string, scanTcpPort int,
 		go func() {
 			defer wg.Done()
 			for ip := range jobs {
-				addr := net.JoinHostPort(ip, strconv.Itoa(scanTcpPort))
-				res := scanOne(ctx, tr, addr, id, saveDir, chatStore, history, aliasStore, rosterStore, reg, autoScan)
+				addr := net.JoinHostPort(ip, strconv.Itoa(n.opts.TCPPort))
+				res := n.scanOne(ctx, addr)
 				results <- res
 			}
 		}()
@@ -300,7 +280,7 @@ func runScan(ctx context.Context, cidr string, scanTcpPort int,
 	return nil
 }
 
-// scanResult is the per-host outcome of runScan.
+// scanResult is the per-host outcome of Scan.
 type scanResult struct {
 	addr   string // "ip:port"
 	peerID string // hex, set on success
@@ -309,43 +289,27 @@ type scanResult struct {
 
 // scanOne does a single dial+handshake against addr and
 // reports the result. On success, it registers the
-// channel in reg (so chat/file/roster work for the
-// duration of the session) and returns the peerID.
-//
-// This duplicates a few lines of dialAddr because we
-// need the synchronous result here. Keeping it inline
-// is simpler than refactoring dialAddr to return
-// (peerID, error) — that's a bigger API change for
-// one caller. If a third caller wants the same
-// synchronous result, we can extract a shared
-// dialAndHandshakeSync helper at that point.
-func scanOne(ctx context.Context, tr *transport.Transport, addr string,
-	id *identity.Identity, saveDir string,
-	chatStore *storage.Store, history *[]*storage.Record,
-	aliasStore *alias.Store, rosterStore *roster.Store,
-	reg *channelRegistry, autoScan *autoScanState,
-) scanResult {
+// channel (so chat/file/roster work for the duration of
+// the session) and returns the peerID.
+func (n *Node) scanOne(ctx context.Context, addr string) scanResult {
 	// Per-host timeout. We use a derived context so
 	// one slow host doesn't blow the whole scan's
 	// context budget; the parent ctx still kills
-	// everything on REPL quit.
+	// everything on Close.
 	dctx, cancel := context.WithTimeout(ctx, scanPerHostTimeout)
 	defer cancel()
 
-	conn, err := tr.Dial(dctx, addr)
+	conn, err := n.tr.Dial(dctx, addr)
 	if err != nil {
 		return scanResult{addr: addr, err: err}
 	}
 	defer conn.Close()
-	sess, err := handshake.RunAsInitiator(dctx, id, conn)
+	sess, err := handshake.RunAsInitiator(dctx, n.id, conn)
 	if err != nil {
 		return scanResult{addr: addr, err: err}
 	}
-	// Handshake OK — register the channel. This is
-	// the same path dialAddr uses, but we capture
-	// the peerID before launching the Recv pump.
 	pid := hex.EncodeToString(sess.RemotePeerID)
-	wrapChannel(ctx, conn, sess, reg, saveDir, chatStore, history, id, aliasStore, rosterStore, autoScan)
+	n.wrapChannel(conn, sess)
 	return scanResult{addr: addr, peerID: pid}
 }
 
@@ -380,7 +344,7 @@ func scanErrorLabel(err error) string {
 // scan output is stable and easy to read. Used by the
 // unit test (which compares the full slice, not a
 // set) and by any future debug log that wants
-// predictable order. Currently runScan doesn't sort
+// predictable order. Currently Scan doesn't sort
 // because Go map iteration over the self/known sets
 // is not deterministic; the e2e test relies on the
 // order being "first match wins", not "lowest IP

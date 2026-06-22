@@ -78,8 +78,9 @@
 ### 2.1 core 不 import 任何 GUI 框架
 
 - 不引 Wails / Tauri / Electron / Qt
-- `internal/` 包路径保证不会跨模块污染
+- `internal/` 包路径保证不会跨模块污染（Go 编译器强制）
 - UI 是**另一个独立仓库**，`go mod require` 这个 core 即可
+- **公开 API 入口**: `pkg/node/` 是唯一对外的包，导出 `*node.Node` 类型和它的方法（`New / Start / Close / SendText / SendFile / Scan / ListPeers / SubscribeMessages / SubscribePeers / History / SetAlias / ListAliases / RemoveAlias / DialAddr`）。`internal/*` 仅供 `pkg/node` 和 `cmd/innerlink` 内部使用。
 
 ### 2.2 不自实现国密算法
 

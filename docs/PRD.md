@@ -16,7 +16,7 @@
 |---|---|
 | 国密合规 | 端到端加密 + 完整性：SM2 ECDH 握手 / SM4-GCM 通信 / SM3 摘要 / SM4-CBC 落盘 |
 | 跨平台 | Windows / macOS / Linux / ARM，零 CGO 编译 |
-| 易嵌入 | 任何 Go 程序（CLI / 桌面 / 嵌入式 / 服务端）只要 import 这 7 个 internal 包就能用 |
+| 易嵌入 | 任何 Go 程序（CLI / 桌面 / 嵌入式 / 服务端）通过 `import "github.com/weishengsuptp/innerlink-core/pkg/node"` 即可构造一个长生命周期 `*node.Node`，调用 `New / Start / SendText / SendFile / ListPeers / SubscribeMessages / History / SetAlias` 等公开 API；底层 12 个 `internal/*` 包仍保持私有，不对外暴露 |
 | 零账号 | 无 CA / 无 PKI / 无中心服务器；每台设备一把 SM2 长期密钥对，PeerID = SM3(公钥)[:16] |
 | 单二进制 | `innerlink.exe` 一个文件就包含全部协议逻辑，可直接运行也可被 import |
 

@@ -281,3 +281,41 @@ a router). v0.5.1 e2e test exercises scan in the
 loopback case; manual test in a real cross-VLAN
 environment is a TODO.
 
+## UI architecture rules (locked 2026-06-22, do not flip)
+
+- **UI must live in a separate repo.** Do NOT add any GUI
+  framework dependency (`wails`, `tauri`, `electron`, `qt`,
+  `gtk`, `fyne`, ...) to this repo. `go.mod` stays pure.
+- **Public API lives in `pkg/node/`, not `internal/`.** As of
+  v0.7, all orchestration (UDP announcer, TCP transport,
+  channel pump, scan, auto-scan, roster gossip, scan-history
+  gossip, chat log, aliases) is exposed through one type:
+  `*node.Node`. Construction: `node.New(node.Options{...})`;
+  lifecycle: `Start(ctx) / Close()`; messaging:
+  `SendText / SendFile / History / SubscribeMessages`;
+  peers: `ListPeers / SubscribePeers / DialAddr`;
+  aliases: `SetAlias / RemoveAlias / ListAliases`. The
+  12 `internal/*` packages stay private — `Go`'s `internal/`
+  rule means external consumers (the Wails UI, future
+  mobile clients) cannot import them, by design.
+- **Core is single-process, no daemon.** No HTTP server,
+  no JSON-RPC listener, no long-lived background service.
+  The CLI binary is the only process. UI talks to core
+  through whatever language-native bridge the UI stack
+  offers (e.g. Wails' Go ↔ JS binding), never through
+  IPC over a socket.
+- **Desktop UI stack is Wails** (Go backend + system
+  WebView frontend). Wails lets the UI repo import
+  innerlink-core directly in Go and expose those
+  functions to the JS layer — no IPC layer needed.
+  Tauri / Electron are explicitly rejected: Tauri would
+  force a Rust shim and either a subprocess + JSON-RPC
+  (which breaks "no daemon") or a Go FFI bridge
+  (defeats the point of Tauri being Rust-first).
+  Electron is rejected on bundle size.
+- **Each platform family gets its own UI repo, not per-OS
+  repos.** Wails covers Win + macOS + Linux from one
+  codebase; if mobile is added later it goes into a
+  separate `innerlink-mobile` repo (Flutter / RN), not
+  split per-OS.
+
