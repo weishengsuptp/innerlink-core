@@ -153,6 +153,23 @@ func listAliases(nd *node.Node) {
 
 func cmdPeers(nd *node.Node) {
 	peers := nd.ListPeers()
+	// Filter out self. The v0.7 ListPeers() includes the
+	// own entry (IsSelf=true) so callers can render "you + N
+	// others" or check the roster against SelfPeerID(). The
+	// CLI REPL matches v0.6 semantics, where self was never
+	// visible via `peers` — the e2e TestE2E_ThreePeerMesh
+	// gates on `[PEERS] 2 known peer` (alice + charlie,
+	// without the local node). Keeping self out of the CLI
+	// output preserves the v0.6 contract and keeps the test
+	// green.
+	filtered := peers[:0:0]
+	for _, p := range peers {
+		if p.IsSelf {
+			continue
+		}
+		filtered = append(filtered, p)
+	}
+	peers = filtered
 	if len(peers) == 0 {
 		log.Printf("[INFO ] no peers seen yet")
 		return

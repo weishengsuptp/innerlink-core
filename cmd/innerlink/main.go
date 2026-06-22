@@ -114,12 +114,19 @@ func run() error {
 		return err
 	}
 
-	// REPL blocks until stdin closes or `quit`/`exit`
-	// is typed. The signal handler above will also
-	// cancel sigCtx, which would shut the runtime
-	// down via nd.Close(); the REPL returns when
-	// the user types quit OR when stdin is closed.
-	runREPL(nd)
+	// REPL runs in its own goroutine because v0.6.x's
+	// `go runStdinLoop(...)` had the same shape. We
+	// used to call runREPL synchronously here, but
+	// that turned a stdin-EOF (which happens on the
+	// e2e tests' child processes that never receive
+	// a command) into an immediate main exit, which
+	// triggered nd.Close() — and the in-flight TCP
+	// listener for the rest of the e2e scenario
+	// died before the test could dial it. Run the
+	// REPL in the background and wait on sigCtx so
+	// signal/Close() paths still drive shutdown.
+	go runREPL(nd)
+	<-sigCtx.Done()
 	return nil
 }
 
