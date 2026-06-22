@@ -98,15 +98,8 @@ func cmdPing(nd *node.Node, parts []string) {
 		log.Println("[ERROR] ping: peer ref is empty")
 		return
 	}
-	// SendText("") can't carry ping; ping is a
-	// dedicated protocol envelope. For now we reuse
-	// SendText with a literal convention; the v0.6.1
-	// test suite relies on this path. The proper fix
-	// is a Node.Ping() method on the public API.
-	if err := nd.SendText(parts[1], "ping"); err != nil {
+	if err := nd.Ping(parts[1]); err != nil {
 		log.Printf("[ERROR] %v", err)
-	} else {
-		log.Printf("[MSG  ] out >%s> ping", parts[1])
 	}
 }
 

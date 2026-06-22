@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/weishengsuptp/innerlink-core/internal/filetransfer"
+	"github.com/weishengsuptp/innerlink-core/internal/protocol"
 	"github.com/weishengsuptp/innerlink-core/internal/storage"
 )
 
@@ -137,6 +138,49 @@ func (n *Node) SendFile(peerRef, path string) error {
 	}()
 	return nil
 }
+
+// Ping sends a protocol-level Ping envelope to a peer.
+// The peer's dispatcher auto-replies with Pong (see
+// the wrapChannel recv pump), which is logged and
+// counted as a touch in the alias store. Returns an
+// error if no active channel exists.
+//
+// Distinct from SendText("ping"), which sends a regular
+// chat message and never gets an automatic reply.
+// Protocol Ping is the v0.4+ liveness probe and is what
+// the CLI's `ping <peer>` command + the
+// TestE2E_PingPongRoundTrip test rely on.
+func (n *Node) Ping(peerRef string) error {
+	if n.ctx == nil {
+		return errors.New("node: not started")
+	}
+	if peerRef == "" {
+		return errors.New("peer ref is empty")
+	}
+	peerHexStr, err := n.resolvePeerRef(peerRef)
+	if err != nil {
+		return err
+	}
+	pid, err := hexToBytes(peerHexStr)
+	if err != nil {
+		return errors.New("bad peer id hex: " + err.Error())
+	}
+	st := n.channels.get(pid)
+	if st == nil {
+		return errors.New("no active channel for peer " + peerHexStr)
+	}
+	if err := st.ch.SendPing(n.ctx); err != nil {
+		return err
+	}
+	log.Printf("[MSG  ] out >%s> ping", peerHexStr)
+	return nil
+}
+
+// keep helpers.go from being the only file that owns
+// the protocol package — messages.go needs SendPing.
+// (Node already imports protocol via channelState;
+// this comment is for the linter.)
+var _ protocol.Envelope // reference to silence "unused import"
 
 // History returns the most recent chat records from
 // the encrypted local log. If peerRef is non-empty,
